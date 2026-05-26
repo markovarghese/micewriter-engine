@@ -13,6 +13,7 @@ pub const MSG_INGEST_RECORD: u8 = 0x02;
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterSchema {
     pub table: String,
+    #[allow(dead_code)] // part of IPC wire protocol; reserved for future use
     pub schema_id: Option<i32>,
     /// Iceberg namespace path components, e.g. ["micewriter"].
     pub namespace: Vec<String>,

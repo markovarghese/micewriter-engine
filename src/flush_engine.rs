@@ -7,7 +7,7 @@ use rand::Rng;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::iceberg_writer;
+use crate::iceberg_writer::{self, CatalogHandle, IcebergState};
 use crate::parquet_writer;
 use crate::protocol::RegisterSchema;
 use crate::rocksdb_store::RocksStore;
@@ -15,24 +15,19 @@ use crate::uds_server::SchemaRegistry;
 
 /// Background task: sleeps for a jittered interval, then rotates the active
 /// RocksDB column family and flushes all frozen records to Iceberg.
-///
-/// This loop runs indefinitely until the process exits (SIGTERM or Ctrl+C
-/// triggers an emergency flush in `main.rs` first).
 pub async fn run_flush_loop(
     store: Arc<RocksStore>,
     registry: SchemaRegistry,
     config: Arc<Config>,
+    state: Arc<IcebergState>,
 ) {
     loop {
         let sleep_secs = jittered_interval(&config);
         info!(secs = sleep_secs, "Next flush scheduled");
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
 
-        if let Err(e) = do_flush(Arc::clone(&store), &registry, &config).await {
+        if let Err(e) = do_flush(Arc::clone(&store), &registry, &config, &state).await {
             error!("Flush cycle failed: {:#}", e);
-            // Continue looping — a failed flush leaves data in the frozen CF which
-            // will be picked up by the `drop_frozen_cf` guard. For now we just log
-            // and wait for the next cycle.
         }
     }
 }
@@ -42,6 +37,7 @@ pub async fn do_flush(
     store: Arc<RocksStore>,
     registry: &SchemaRegistry,
     config: &Config,
+    state: &IcebergState,
 ) -> Result<()> {
     info!("Starting flush cycle");
 
@@ -72,7 +68,7 @@ pub async fn do_flush(
             warn!("Skipping malformed record (too short for table name and schema id)");
             continue;
         }
-        
+
         let table_name_bytes = &bytes[2..2 + table_name_len];
         match std::str::from_utf8(table_name_bytes) {
             Ok(t) => by_table.entry(t.to_string()).or_default().push(bytes),
@@ -82,7 +78,9 @@ pub async fn do_flush(
 
     info!(tables = by_table.len(), "Flushing tables");
 
-    // Compile and commit each table independently.
+    // Build the catalog once for the entire flush cycle.
+    let catalog = iceberg_writer::build_catalog(config).await?;
+
     let schemas = registry.read().unwrap().clone();
 
     let mut all_ok = true;
@@ -96,7 +94,7 @@ pub async fn do_flush(
             }
         };
 
-        match compile_and_commit(table_name, records, schema, config).await {
+        match compile_and_commit(&catalog, state, table_name, records, schema, config).await {
             Ok(_) => info!(table = %table_name, "Table flushed"),
             Err(e) => {
                 error!(table = %table_name, "Table flush failed: {:#}", e);
@@ -121,20 +119,23 @@ pub async fn do_flush(
 }
 
 async fn compile_and_commit(
+    catalog: &CatalogHandle,
+    state: &IcebergState,
     table_name: &str,
     records: &[Vec<u8>],
     schema: &RegisterSchema,
     config: &Config,
 ) -> Result<()> {
-    // Parquet compilation blocks the thread. We should run it on spawn_blocking.
     let records_clone = records.to_vec();
     let fields_clone = schema.fields.clone();
-    
+
     let parquet_bytes = tokio::task::spawn_blocking(move || {
         parquet_writer::compile(&records_clone, &fields_clone)
     }).await??;
 
     iceberg_writer::flush_table(
+        catalog,
+        state,
         table_name,
         &schema.namespace,
         parquet_bytes,
@@ -146,7 +147,9 @@ async fn compile_and_commit(
 
 fn jittered_interval(config: &Config) -> u64 {
     let jitter = rand::thread_rng().gen_range(0..=config.flush_jitter_secs * 2);
-    // Avoid underflow: base + jitter - max_jitter, clamped to at least 60s.
-    let secs = config.flush_interval_secs.saturating_add(jitter).saturating_sub(config.flush_jitter_secs);
+    let secs = config
+        .flush_interval_secs
+        .saturating_add(jitter)
+        .saturating_sub(config.flush_jitter_secs);
     secs.max(60)
 }

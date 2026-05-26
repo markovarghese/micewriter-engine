@@ -19,8 +19,6 @@ pub struct Config {
     pub minio_secret_key: Option<String>,
     pub nessie_uri: Option<String>,
 
-    /// Destination bucket for Nessie/MinIO (e.g. iceberg)
-    pub minio_bucket: String,
     /// Iceberg warehouse location prefix (e.g. s3://iceberg)
     pub warehouse: String,
 
@@ -62,7 +60,6 @@ impl Config {
             minio_access_key,
             minio_secret_key,
             nessie_uri,
-            minio_bucket: env::var("MINIO_BUCKET").unwrap_or_else(|_| "iceberg".to_string()),
             warehouse: env::var("WAREHOUSE")
                 .or_else(|_| env::var("NESSIE_WAREHOUSE"))
                 .unwrap_or_else(|_| "s3://iceberg".to_string()),
