@@ -36,7 +36,7 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | Byte 0 | Remaining bytes | Direction |
 |--------|----------------|-----------|
 | `0x01` | JSON `RegisterSchema` | SDK → Engine |
-| `0x02` | JSON `IngestRecord` | SDK → Engine |
+| `0x02` | Native Arrow IPC `IngestRecord` | SDK → Engine |
 | *(any)* | JSON `AckResponse` | Engine → SDK |
 
 ## Environment Variables
@@ -79,8 +79,4 @@ docker build -t micewriter-engine:latest .
 
 ## Iceberg Dependency Versions
 
-Pin `iceberg` and `iceberg-catalog-rest` in `Cargo.toml` to the same version.
-Check [crates.io/crates/iceberg](https://crates.io/crates/iceberg) for the latest.
-If `fast_append` or `FileIO` writer APIs differ from what the code expects, the
-`python-iceberg` feature flag (`cargo build --features python-iceberg`) activates
-a `pyo3`+`pyiceberg` fallback path for catalog operations only.
+We use `iceberg-rust` v0.9+ for full native support of `fast_append` and FileIO operations without needing Python fallbacks.
