@@ -13,6 +13,7 @@ pub const MSG_INGEST_RECORD: u8 = 0x02;
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterSchema {
     pub table: String,
+    pub schema_id: Option<i32>,
     /// Iceberg namespace path components, e.g. ["micewriter"].
     pub namespace: Vec<String>,
     pub fields: Vec<FieldDef>,
@@ -33,17 +34,18 @@ fn bool_true() -> bool {
     true
 }
 
-/// Hot-path telemetry record. One per `.send(pojo)` call.
-/// Payload encoding: JSON (same framing as schema, type discriminant differs).
+/// Hot-path telemetry record stream.
+/// Payload encoding: Custom Binary Framing.
+/// 
+/// The `MSG_INGEST_RECORD` payload (everything after the 4-byte length and 1-byte discriminant) 
+/// is structured as follows:
+///   [table_name_len: u16] (2 bytes, big-endian)
+///   [table_name_bytes]    (UTF-8 string)
+///   [schema_id: i32]      (4 bytes, big-endian)
+///   [Arrow IPC Stream]    (Remaining bytes, raw native Apache Arrow IPC stream format)
 ///
-/// Note: switching to Protobuf/Bincode here is a future optimisation.
-/// The engine currently stores the raw JSON bytes in RocksDB as-is.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct IngestRecord {
-    pub table: String,
-    /// Ordered list of (field_name, value) pairs matching the registered schema.
-    pub fields: Vec<(String, serde_json::Value)>,
-}
+/// This eliminates the need for a JSON `IngestRecord` struct, as the engine
+/// passes the raw Arrow bytes directly to RocksDB and then directly to the Parquet compiler.
 
 // ---------------------------------------------------------------------------
 // Outbound messages (Engine → Java SDK)

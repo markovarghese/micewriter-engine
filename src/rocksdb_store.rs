@@ -13,7 +13,7 @@ const INITIAL_CF: &str = "active";
 /// Thread-safe RocksDB wrapper that manages the active/frozen column-family
 /// rotation used to implement the jittered flush cycle.
 pub struct RocksStore {
-    db: Arc<DB>,
+    db: Arc<RwLock<DB>>,
     /// Name of the CF currently receiving new record appends.
     active_cf: Arc<RwLock<String>>,
     /// Monotonically increasing record key (8-byte big-endian).
@@ -52,7 +52,7 @@ impl RocksStore {
         info!(cf = %active_name, "RocksDB opened, active column family");
 
         Ok(Self {
-            db: Arc::new(db),
+            db: Arc::new(RwLock::new(db)),
             active_cf: Arc::new(RwLock::new(active_name)),
             counter: AtomicU64::new(0),
         })
@@ -62,11 +62,12 @@ impl RocksStore {
     pub fn append(&self, value: &[u8]) -> Result<()> {
         let key = self.counter.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let cf_name = self.active_cf.read().unwrap().clone();
-        let cf = self
-            .db
+        
+        let db_lock = self.db.read().unwrap();
+        let cf = db_lock
             .cf_handle(&cf_name)
             .ok_or_else(|| anyhow!("CF '{}' not found", cf_name))?;
-        self.db.put_cf(&cf, key, value)?;
+        db_lock.put_cf(&cf, key, value)?;
         Ok(())
     }
 
@@ -87,7 +88,7 @@ impl RocksStore {
                 .as_secs();
             let new_cf = format!("active_{}", ts);
 
-            self.db.create_cf(&new_cf, &Options::default())?;
+            self.db.write().unwrap().create_cf(&new_cf, &Options::default())?;
             *active = new_cf;
             frozen
         };
@@ -95,13 +96,12 @@ impl RocksStore {
         info!(frozen = %frozen_name, "Column family rotated");
 
         // Drain all records from the now-frozen CF.
-        let cf = self
-            .db
+        let db_lock = self.db.read().unwrap();
+        let cf = db_lock
             .cf_handle(&frozen_name)
             .ok_or_else(|| anyhow!("frozen CF '{}' not found", frozen_name))?;
 
-        let records = self
-            .db
+        let records = db_lock
             .full_iterator_cf(&cf, rocksdb::IteratorMode::Start)
             .map(|r| r.map(|(_, v)| v.to_vec()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -113,7 +113,7 @@ impl RocksStore {
 
     /// Drop the frozen column family after a successful Iceberg commit.
     pub fn drop_frozen_cf(&self, name: &str) -> Result<()> {
-        self.db.drop_cf(name)?;
+        self.db.write().unwrap().drop_cf(name)?;
         info!(cf = %name, "Frozen CF dropped");
         Ok(())
     }

@@ -1,17 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent, CatalogBuilder};
+use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
+use iceberg_catalog_glue::{GlueCatalog, GlueCatalogBuilder};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, CatalogType};
 use crate::protocol::FieldDef;
 
-/// Flush one table's Parquet bytes to MinIO and commit to the Nessie catalog.
+/// Flush one table's Parquet bytes to MinIO/S3 and commit to the configured catalog.
 ///
 /// Retries the catalog commit up to `max_attempts` times with exponential backoff
 /// to handle optimistic locking conflicts (`CommitFailedException`).
@@ -26,8 +28,26 @@ pub async fn flush_table(
         return Ok(());
     }
 
-    let catalog = build_catalog(config).await?;
+    match config.catalog_type {
+        CatalogType::Nessie => {
+            let catalog = build_nessie_catalog(config).await?;
+            do_flush_table(&catalog, table_name, namespace, parquet_bytes, field_defs, config).await
+        }
+        CatalogType::Glue => {
+            let catalog = build_glue_catalog(config).await?;
+            do_flush_table(&catalog, table_name, namespace, parquet_bytes, field_defs, config).await
+        }
+    }
+}
 
+async fn do_flush_table<C: Catalog>(
+    catalog: &C,
+    table_name: &str,
+    namespace: &[String],
+    parquet_bytes: Vec<u8>,
+    field_defs: &[FieldDef],
+    _config: &Config,
+) -> Result<()> {
     let ns_ident = NamespaceIdent::from_vec(namespace.to_vec())?;
     let table_ident = TableIdent::new(ns_ident.clone(), table_name.to_string());
 
@@ -58,34 +78,34 @@ pub async fn flush_table(
         Uuid::new_v4()
     );
 
-    // Write Parquet bytes to MinIO via the table's FileIO abstraction.
+    // Write Parquet bytes to S3 via the table's FileIO abstraction.
     let file_io = table.file_io();
     let output = file_io.new_output(&file_path)?;
     let mut writer = output.writer().await?;
-    writer.write_all(&parquet_bytes).await?;
+    writer.write(parquet_bytes.clone().into()).await?;
     writer.close().await?;
 
-    info!(path = %file_path, bytes = parquet_bytes.len(), "Parquet file uploaded to MinIO");
+    info!(path = %file_path, bytes = parquet_bytes.len(), "Parquet file uploaded to S3");
 
     // Build the DataFile descriptor.
-    use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, FileFormat};
+    use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat};
     let data_file = DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_path(file_path)
-        .file_format(FileFormat::Parquet)
+        .file_format(DataFileFormat::Parquet)
         .record_count(0) // Iceberg allows 0 here; real count improves stats
-        .file_size_in_bytes(parquet_bytes.len() as i64)
+        .file_size_in_bytes(parquet_bytes.len() as u64)
         .build()?;
 
     // Commit with exponential backoff on optimistic locking conflicts.
-    commit_with_retry(&catalog, &table, data_file).await?;
+    commit_with_retry(catalog, &table, data_file).await?;
 
     info!(table = %table_name, "Iceberg commit successful");
     Ok(())
 }
 
-async fn commit_with_retry(
-    catalog: &RestCatalog,
+async fn commit_with_retry<C: Catalog>(
+    catalog: &C,
     table: &iceberg::table::Table,
     data_file: iceberg::spec::DataFile,
 ) -> Result<()> {
@@ -100,12 +120,14 @@ async fn commit_with_retry(
             table.clone()
         };
 
-        use iceberg::transaction::Transaction;
-        let tx = Transaction::new(&fresh_table);
-        let result = tx
-            .fast_append(None, vec![data_file.clone()])?
-            .commit(catalog)
-            .await;
+        use iceberg::transaction::{Transaction, ApplyTransactionAction};
+        let result = async {
+            let tx = Transaction::new(&fresh_table);
+            let action = tx.fast_append()
+              .add_data_files(vec![data_file.clone()]);
+            let tx = action.apply(tx)?;
+            tx.commit(catalog).await
+        }.await;
 
         match result {
             Ok(_) => return Ok(()),
@@ -121,20 +143,35 @@ async fn commit_with_retry(
     unreachable!()
 }
 
-async fn build_catalog(config: &Config) -> Result<RestCatalog> {
-    let catalog_config = RestCatalogConfig::builder()
-        .uri(config.nessie_uri.clone())
-        .warehouse(config.nessie_warehouse.clone())
-        .props([
-            ("s3.endpoint".to_string(), config.minio_url.clone()),
-            ("s3.access-key-id".to_string(), config.minio_access_key.clone()),
-            ("s3.secret-access-key".to_string(), config.minio_secret_key.clone()),
-            // MinIO requires path-style S3 addressing.
-            ("s3.path-style-access".to_string(), "true".to_string()),
-        ])
-        .build();
+async fn build_nessie_catalog(config: &Config) -> Result<RestCatalog> {
+    let mut props = HashMap::from([
+        ("s3.endpoint".to_string(), config.minio_url.clone().unwrap()),
+        ("s3.access-key-id".to_string(), config.minio_access_key.clone().unwrap()),
+        ("s3.secret-access-key".to_string(), config.minio_secret_key.clone().unwrap()),
+        ("s3.path-style-access".to_string(), "true".to_string()),
+        ("warehouse".to_string(), config.warehouse.clone()),
+    ]);
+    props.insert("uri".to_string(), config.nessie_uri.clone().unwrap());
 
-    Ok(RestCatalog::new(catalog_config))
+    let catalog = RestCatalogBuilder::default()
+        .load("rest_catalog", props)
+        .await?;
+
+    Ok(catalog)
+}
+
+async fn build_glue_catalog(config: &Config) -> Result<GlueCatalog> {
+    let mut props = HashMap::new();
+    props.insert("warehouse".to_string(), config.warehouse.clone());
+    if let Some(ref catalog_id) = config.glue_catalog_id {
+        props.insert("catalog_id".to_string(), catalog_id.clone());
+    }
+
+    let catalog = GlueCatalogBuilder::default()
+        .load("glue_catalog", props)
+        .await?;
+
+    Ok(catalog)
 }
 
 fn build_iceberg_schema(fields: &[FieldDef]) -> Result<Schema> {

@@ -2,17 +2,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use crate::protocol::{
-    AckResponse, FieldDef, IngestRecord, RegisterSchema, MSG_INGEST_RECORD, MSG_REGISTER_SCHEMA,
+    AckResponse, RegisterSchema, MSG_INGEST_RECORD, MSG_REGISTER_SCHEMA,
 };
 use crate::rocksdb_store::RocksStore;
 
 pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
+
+const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024; // 128 MB
 
 /// Listen on `socket_path` and spawn a handler task for every incoming connection.
 ///
@@ -30,6 +32,8 @@ pub async fn run_server(
     let listener = UnixListener::bind(socket_path)?;
     info!(path = %socket_path, "UDS listener ready");
 
+    let mut join_set = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -37,7 +41,7 @@ pub async fn run_server(
                     Ok((stream, _)) => {
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
-                        tokio::spawn(async move {
+                        join_set.spawn(async move {
                             if let Err(e) = handle_connection(stream, store, registry).await {
                                 error!("Connection handler error: {:#}", e);
                             }
@@ -48,10 +52,16 @@ pub async fn run_server(
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    info!("UDS server shutting down");
+                    info!("UDS server shutting down - waiting for active connections to drain");
                     break;
                 }
             }
+        }
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        if let Err(e) = res {
+            error!("Handler panicked: {}", e);
         }
     }
 
@@ -77,17 +87,21 @@ async fn handle_connection(
             continue;
         }
 
+        if msg_len > MAX_PAYLOAD_SIZE {
+            error!("Payload size {} exceeds maximum allowed ({}). Closing connection.", msg_len, MAX_PAYLOAD_SIZE);
+            return Err(anyhow::anyhow!("payload too large"));
+        }
+
         // --- Read the full payload ---
         let mut payload = vec![0u8; msg_len];
         stream.read_exact(&mut payload).await?;
 
         // --- First byte = message type discriminant ---
         let msg_type = payload[0];
-        let body = &payload[1..];
 
         let ack = match msg_type {
-            MSG_REGISTER_SCHEMA => handle_register_schema(body, &registry),
-            MSG_INGEST_RECORD => handle_ingest_record(body, &store, &registry),
+            MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
+            MSG_INGEST_RECORD => handle_ingest_record(payload, store.clone(), &registry).await,
             other => {
                 warn!(byte = other, "Unknown message type");
                 AckResponse::error(format!("unknown message type 0x{:02X}", other))
@@ -120,30 +134,46 @@ fn handle_register_schema(body: &[u8], registry: &SchemaRegistry) -> AckResponse
     }
 }
 
-fn handle_ingest_record(
-    body: &[u8],
-    store: &RocksStore,
+async fn handle_ingest_record(
+    payload: Vec<u8>,
+    store: Arc<RocksStore>,
     registry: &SchemaRegistry,
 ) -> AckResponse {
-    // Validate the table is known before writing to RocksDB.
-    let record: IngestRecord = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to deserialize IngestRecord: {}", e);
-            return AckResponse::error(e.to_string());
-        }
+    let body = &payload[1..];
+
+    if body.len() < 2 {
+        return AckResponse::error("invalid ingest record payload");
+    }
+    
+    let table_name_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + table_name_len + 4 {
+        return AckResponse::error("payload too short for table name and schema id");
+    }
+    
+    let table_name_bytes = &body[2..2 + table_name_len];
+    let table_name = match std::str::from_utf8(table_name_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return AckResponse::error("invalid utf-8 in table name"),
     };
 
-    if !registry.read().unwrap().contains_key(&record.table) {
-        return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", record.table));
+    if !registry.read().unwrap().contains_key(&table_name) {
+        return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", table_name));
     }
 
-    // Store the raw JSON bytes so the flush engine can reconstruct field values.
-    match store.append(body) {
-        Ok(_) => AckResponse::ok(),
-        Err(e) => {
+    // Store the raw bytes so the flush engine can pass them to the Parquet Arrow IPC reader.
+    let res = tokio::task::spawn_blocking(move || {
+        store.append(&payload[1..])
+    }).await;
+
+    match res {
+        Ok(Ok(_)) => AckResponse::ok(),
+        Ok(Err(e)) => {
             error!("RocksDB append error: {}", e);
             AckResponse::error(e.to_string())
+        }
+        Err(e) => {
+            error!("Task join error: {}", e);
+            AckResponse::error("internal thread error")
         }
     }
 }

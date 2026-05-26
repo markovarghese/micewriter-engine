@@ -56,14 +56,15 @@ async fn main() -> Result<()> {
     // Stop the UDS server from accepting new connections.
     let _ = shutdown_tx.send(true);
 
+    info!("Waiting for active UDS connections to drain...");
+    let _ = uds_handle.await;
+
     // Emergency flush: drain anything in the active CF before exiting.
-    if let Err(e) = flush_engine::do_flush(&store, &registry, &config).await {
+    if let Err(e) = flush_engine::do_flush(Arc::clone(&store), &registry, &config).await {
         tracing::error!("Emergency flush failed: {:#}", e);
     } else {
         info!("Emergency flush complete");
     }
-
-    uds_handle.abort();
 
     info!("mIceWriter Engine exited cleanly");
     Ok(())

@@ -43,12 +43,14 @@ All frames use a **4-byte big-endian length prefix** followed by:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MINIO_URL` | yes | — | MinIO S3 API base URL |
-| `MINIO_ACCESS_KEY` | yes | — | MinIO access key |
-| `MINIO_SECRET_KEY` | yes | — | MinIO secret key |
+| `CATALOG_TYPE` | no | `nessie` | Which catalog to use: `nessie` or `glue` |
+| `MINIO_URL` | if nessie| — | MinIO S3 API base URL |
+| `MINIO_ACCESS_KEY` | if nessie| — | MinIO access key |
+| `MINIO_SECRET_KEY` | if nessie| — | MinIO secret key |
 | `MINIO_BUCKET` | no | `iceberg` | Destination bucket |
-| `NESSIE_URI` | yes | — | Nessie Iceberg REST catalog URI |
-| `NESSIE_WAREHOUSE` | no | `s3://iceberg` | Iceberg warehouse path |
+| `NESSIE_URI` | if nessie| — | Nessie Iceberg REST catalog URI |
+| `WAREHOUSE` | no | `s3://iceberg` | Iceberg warehouse path |
+| `GLUE_CATALOG_ID` | no | — | AWS account ID for Glue Catalog |
 | `SOCKET_PATH` | no | `/var/run/app/iceberg.sock` | UDS socket path |
 | `ROCKSDB_PATH` | no | `/var/lib/rocksdb` | RocksDB data directory |
 | `FLUSH_INTERVAL_SECS` | no | `600` | Base flush interval |

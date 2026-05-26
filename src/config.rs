@@ -1,20 +1,31 @@
 use std::env;
 use anyhow::{Context, Result};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogType {
+    Nessie,
+    Glue,
+}
+
 pub struct Config {
+    pub catalog_type: CatalogType,
+
     /// Path to the Unix Domain Socket the UDS server listens on.
     pub socket_path: String,
 
-    /// MinIO S3 API base URL (e.g. http://minio-api.local).
-    pub minio_url: String,
-    pub minio_access_key: String,
-    pub minio_secret_key: String,
-    pub minio_bucket: String,
+    // MinIO / Nessie specific properties (required if catalog_type == Nessie)
+    pub minio_url: Option<String>,
+    pub minio_access_key: Option<String>,
+    pub minio_secret_key: Option<String>,
+    pub nessie_uri: Option<String>,
 
-    /// Nessie Iceberg REST Catalog URI (e.g. http://nessie.local/iceberg/v1).
-    pub nessie_uri: String,
-    /// Iceberg warehouse location prefix (e.g. s3://iceberg).
-    pub nessie_warehouse: String,
+    /// Destination bucket for Nessie/MinIO (e.g. iceberg)
+    pub minio_bucket: String,
+    /// Iceberg warehouse location prefix (e.g. s3://iceberg)
+    pub warehouse: String,
+
+    // AWS Glue specific properties
+    pub glue_catalog_id: Option<String>,
 
     /// Base flush interval in seconds (default 600 = 10 minutes).
     pub flush_interval_secs: u64,
@@ -27,16 +38,35 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let catalog_type = match env::var("CATALOG_TYPE").unwrap_or_else(|_| "nessie".to_string()).to_lowercase().as_str() {
+            "glue" => CatalogType::Glue,
+            _ => CatalogType::Nessie,
+        };
+
+        let minio_url = env::var("MINIO_URL").ok();
+        let minio_access_key = env::var("MINIO_ACCESS_KEY").ok();
+        let minio_secret_key = env::var("MINIO_SECRET_KEY").ok();
+        let nessie_uri = env::var("NESSIE_URI").ok();
+
+        if catalog_type == CatalogType::Nessie {
+            if minio_url.is_none() || minio_access_key.is_none() || minio_secret_key.is_none() || nessie_uri.is_none() {
+                anyhow::bail!("MINIO_URL, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, and NESSIE_URI are required when CATALOG_TYPE=nessie");
+            }
+        }
+
         Ok(Self {
+            catalog_type,
             socket_path: env::var("SOCKET_PATH")
                 .unwrap_or_else(|_| "/var/run/app/iceberg.sock".to_string()),
-            minio_url: env::var("MINIO_URL").context("MINIO_URL required")?,
-            minio_access_key: env::var("MINIO_ACCESS_KEY").context("MINIO_ACCESS_KEY required")?,
-            minio_secret_key: env::var("MINIO_SECRET_KEY").context("MINIO_SECRET_KEY required")?,
+            minio_url,
+            minio_access_key,
+            minio_secret_key,
+            nessie_uri,
             minio_bucket: env::var("MINIO_BUCKET").unwrap_or_else(|_| "iceberg".to_string()),
-            nessie_uri: env::var("NESSIE_URI").context("NESSIE_URI required")?,
-            nessie_warehouse: env::var("NESSIE_WAREHOUSE")
+            warehouse: env::var("WAREHOUSE")
+                .or_else(|_| env::var("NESSIE_WAREHOUSE"))
                 .unwrap_or_else(|_| "s3://iceberg".to_string()),
+            glue_catalog_id: env::var("GLUE_CATALOG_ID").ok(),
             flush_interval_secs: env::var("FLUSH_INTERVAL_SECS")
                 .unwrap_or_else(|_| "600".to_string())
                 .parse()

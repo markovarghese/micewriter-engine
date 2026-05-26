@@ -5,7 +5,7 @@
 # RocksDB compiles from C++ source by default (statically linked into binary).
 # Requires a C++ toolchain + cmake.
 # ---------------------------------------------------------------------------
-FROM rust:1.79-slim AS builder
+FROM rust:slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \

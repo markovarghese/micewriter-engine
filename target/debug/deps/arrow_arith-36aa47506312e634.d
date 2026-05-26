@@ -1,0 +1,12 @@
+/app/target/debug/deps/arrow_arith-36aa47506312e634.d: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/lib.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/aggregate.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arithmetic.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arity.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/bitwise.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/boolean.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/numeric.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/temporal.rs
+
+/app/target/debug/deps/libarrow_arith-36aa47506312e634.rmeta: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/lib.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/aggregate.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arithmetic.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arity.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/bitwise.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/boolean.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/numeric.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/temporal.rs
+
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/lib.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/aggregate.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arithmetic.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/arity.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/bitwise.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/boolean.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/numeric.rs:
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-arith-57.3.1/src/temporal.rs:

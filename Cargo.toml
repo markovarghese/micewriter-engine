@@ -15,12 +15,13 @@ tokio = { version = "1", features = ["full"] }
 rocksdb = "0.22"
 
 # Apache Iceberg — REST catalog (Nessie) + FileIO (S3/MinIO)
-iceberg = "0.3"
-iceberg-catalog-rest = "0.3"
+iceberg = "0.9"
+iceberg-catalog-rest = "0.9"
+iceberg-catalog-glue = "0.9"
 
 # Columnar in-memory format and Parquet serialization
-arrow = "52"
-parquet = { version = "52", features = ["arrow"] }
+arrow = "57"
+parquet = { version = "57", features = ["arrow"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -42,8 +43,5 @@ uuid = { version = "1", features = ["v4"] }
 
 # Byte buffers
 bytes = "1"
-
 [features]
-# Opt-in Python fallback for Iceberg operations not yet in iceberg-rust
-python-iceberg = ["pyo3"]
-pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }
+# Native Rust Iceberg support is sufficient; no Python fallback needed.
