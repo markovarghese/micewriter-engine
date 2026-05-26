@@ -1,1 +1,0 @@
-const SERDE_DESERIALIZE_MODE: DeserializeMode = DeserializeMode::Strict;

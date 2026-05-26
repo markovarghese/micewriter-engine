@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# Local environment overrides (may contain MinIO/Nessie secrets)
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
