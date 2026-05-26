@@ -9,6 +9,9 @@
 .vscode/
 .idea/
 
+# Claude Code project settings
+.claude/
+
 # Windows
 Thumbs.db
 Desktop.ini
