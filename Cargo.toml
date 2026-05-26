@@ -1,0 +1,49 @@
+[package]
+name = "micewriter-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "micewriter-engine"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Local cache
+rocksdb = "0.22"
+
+# Apache Iceberg — REST catalog (Nessie) + FileIO (S3/MinIO)
+iceberg = "0.3"
+iceberg-catalog-rest = "0.3"
+
+# Columnar in-memory format and Parquet serialization
+arrow = "52"
+parquet = { version = "52", features = ["arrow"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Randomness for flush jitter
+rand = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Unique IDs for Parquet file paths
+uuid = { version = "1", features = ["v4"] }
+
+# Byte buffers
+bytes = "1"
+
+[features]
+# Opt-in Python fallback for Iceberg operations not yet in iceberg-rust
+python-iceberg = ["pyo3"]
+pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }
