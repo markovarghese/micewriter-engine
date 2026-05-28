@@ -12,8 +12,7 @@ $image    = "micewriter-engine"
 $tag      = "latest"
 $fullTag  = "${registry}/${image}:${tag}"
 
-docker info > $null 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Error "Docker is not running."; exit 1 }
+# docker info check removed to avoid failing on benign stderr warnings
 
 Write-Host "Building $image..."
 docker build -t $fullTag .

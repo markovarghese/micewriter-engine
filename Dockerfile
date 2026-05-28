@@ -49,6 +49,6 @@ COPY --from=builder /app/target/release/micewriter-engine /usr/local/bin/micewri
 RUN mkdir -p /var/run/app /var/lib/rocksdb \
     && chown micewriter:daemon /var/run/app /var/lib/rocksdb
 
-USER micewriter
+USER 1000
 
 ENTRYPOINT ["/usr/local/bin/micewriter-engine"]

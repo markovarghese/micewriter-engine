@@ -54,8 +54,7 @@ pub fn compile(records: &[Vec<u8>], _field_defs: &[FieldDef]) -> Result<Vec<u8>>
         }
     }
     
-    if let Some(mut w) = writer {
-        w.finish()?;
+    if let Some(w) = writer {
         let buf = w.into_inner()?;
         return Ok(buf);
     }
