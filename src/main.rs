@@ -28,16 +28,20 @@ async fn main() -> Result<()> {
     let registry: uds_server::SchemaRegistry = Arc::new(RwLock::new(HashMap::new()));
     let iceberg_state = Arc::new(iceberg_writer::IcebergState::default());
 
+    let flush_trigger = Arc::new(tokio::sync::Notify::new());
+
     // Channel used to signal the UDS server to stop accepting new connections.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn the UDS server.
     let uds_store = Arc::clone(&store);
     let uds_registry = Arc::clone(&registry);
+    let uds_config = Arc::clone(&config);
+    let uds_flush_trigger = Arc::clone(&flush_trigger);
     let uds_socket = config.socket_path.clone();
     let uds_handle = tokio::spawn(async move {
         if let Err(e) =
-            uds_server::run_server(&uds_socket, uds_store, uds_registry, shutdown_rx).await
+            uds_server::run_server(&uds_socket, uds_store, uds_registry, uds_config, uds_flush_trigger, shutdown_rx).await
         {
             tracing::error!("UDS server error: {:#}", e);
         }
@@ -48,8 +52,9 @@ async fn main() -> Result<()> {
     let flush_registry = Arc::clone(&registry);
     let flush_config = Arc::clone(&config);
     let flush_state = Arc::clone(&iceberg_state);
+    let flush_loop_trigger = Arc::clone(&flush_trigger);
     tokio::spawn(async move {
-        flush_engine::run_flush_loop(flush_store, flush_registry, flush_config, flush_state).await;
+        flush_engine::run_flush_loop(flush_store, flush_registry, flush_config, flush_state, flush_loop_trigger).await;
     });
 
     // Wait for SIGTERM (Kubernetes pod termination) or Ctrl+C (local dev).

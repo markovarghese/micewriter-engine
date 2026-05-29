@@ -30,6 +30,9 @@ pub struct Config {
     /// Maximum random jitter added/subtracted from flush_interval_secs (default 120).
     pub flush_jitter_secs: u64,
 
+    /// If true, the UDS server will accept MSG_FLUSH_NOW (0x03) from the SDK to force an immediate flush.
+    pub enable_manual_flush: bool,
+
     /// Directory for RocksDB files (should be on a dedicated PVC in k8s).
     pub rocksdb_path: String,
 }
@@ -72,6 +75,9 @@ impl Config {
                 .unwrap_or_else(|_| "120".to_string())
                 .parse()
                 .context("FLUSH_JITTER_SECS must be a number")?,
+            enable_manual_flush: env::var("ENABLE_MANUAL_FLUSH")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
             rocksdb_path: env::var("ROCKSDB_PATH")
                 .unwrap_or_else(|_| "/var/lib/rocksdb".to_string()),
         })

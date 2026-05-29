@@ -8,9 +8,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use crate::protocol::{
-    AckResponse, RegisterSchema, MSG_INGEST_RECORD, MSG_REGISTER_SCHEMA,
+    AckResponse, RegisterSchema, MSG_INGEST_RECORD, MSG_REGISTER_SCHEMA, MSG_FLUSH_NOW,
 };
 use crate::rocksdb_store::RocksStore;
+use crate::config::Config;
 
 pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
 
@@ -24,6 +25,8 @@ pub async fn run_server(
     socket_path: &str,
     store: Arc<RocksStore>,
     registry: SchemaRegistry,
+    config: Arc<Config>,
+    flush_trigger: Arc<tokio::sync::Notify>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // Remove stale socket file from a previous run.
@@ -41,8 +44,10 @@ pub async fn run_server(
                     Ok((stream, _)) => {
                         let store = Arc::clone(&store);
                         let registry = Arc::clone(&registry);
+                        let config = Arc::clone(&config);
+                        let flush_trigger = Arc::clone(&flush_trigger);
                         join_set.spawn(async move {
-                            if let Err(e) = handle_connection(stream, store, registry).await {
+                            if let Err(e) = handle_connection(stream, store, registry, config, flush_trigger).await {
                                 error!("Connection handler error: {:#}", e);
                             }
                         });
@@ -73,6 +78,8 @@ async fn handle_connection(
     mut stream: UnixStream,
     store: Arc<RocksStore>,
     registry: SchemaRegistry,
+    config: Arc<Config>,
+    flush_trigger: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     loop {
         // --- Read frame header: 4-byte big-endian total message length ---
@@ -102,6 +109,7 @@ async fn handle_connection(
         let ack = match msg_type {
             MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
             MSG_INGEST_RECORD => handle_ingest_record(payload, store.clone(), &registry).await,
+            MSG_FLUSH_NOW => handle_flush_now(&config, &flush_trigger),
             other => {
                 warn!(byte = other, "Unknown message type");
                 AckResponse::error(format!("unknown message type 0x{:02X}", other))
@@ -131,6 +139,17 @@ fn handle_register_schema(body: &[u8], registry: &SchemaRegistry) -> AckResponse
             error!("Failed to deserialize RegisterSchema: {}", e);
             AckResponse::error(e.to_string())
         }
+    }
+}
+
+fn handle_flush_now(config: &Config, flush_trigger: &tokio::sync::Notify) -> AckResponse {
+    if config.enable_manual_flush {
+        flush_trigger.notify_one();
+        info!("Manual flush requested by client");
+        AckResponse::ok()
+    } else {
+        warn!("Client requested manual flush, but ENABLE_MANUAL_FLUSH is false");
+        AckResponse::error("manual flush is disabled on this server")
     }
 }
 

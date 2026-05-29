@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// First byte of every IPC frame payload identifies the message type.
 pub const MSG_REGISTER_SCHEMA: u8 = 0x01;
 pub const MSG_INGEST_RECORD: u8 = 0x02;
+pub const MSG_FLUSH_NOW: u8 = 0x03;
 
 // ---------------------------------------------------------------------------
 // Inbound messages (Java SDK → Engine)

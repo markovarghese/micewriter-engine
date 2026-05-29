@@ -20,11 +20,20 @@ pub async fn run_flush_loop(
     registry: SchemaRegistry,
     config: Arc<Config>,
     state: Arc<IcebergState>,
+    flush_trigger: Arc<tokio::sync::Notify>,
 ) {
     loop {
         let sleep_secs = jittered_interval(&config);
         info!(secs = sleep_secs, "Next flush scheduled");
-        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {
+                info!("Timer triggered flush");
+            }
+            _ = flush_trigger.notified() => {
+                info!("Manual flush triggered via IPC");
+            }
+        }
 
         if let Err(e) = do_flush(Arc::clone(&store), &registry, &config, &state).await {
             error!("Flush cycle failed: {:#}", e);
