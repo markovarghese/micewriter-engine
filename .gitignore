@@ -18,3 +18,8 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Archives
+*.tar
+*.gz
+*.zip
