@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+**/*.rs.bk
 
 # Local environment overrides (may contain MinIO/Nessie secrets)
 .env
@@ -8,10 +9,12 @@
 # Editor
 .vscode/
 .idea/
+*.swp
 
 # Claude Code project settings
 .claude/
 
-# Windows
+# OS generated files
+.DS_Store
 Thumbs.db
 Desktop.ini
