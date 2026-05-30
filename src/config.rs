@@ -35,6 +35,16 @@ pub struct Config {
 
     /// Directory for RocksDB files (should be on a dedicated PVC in k8s).
     pub rocksdb_path: String,
+
+    /// If true, RocksDB writes use `sync=true` so each batched commit is fsync'd
+    /// before the SDK receives an ACK. Default true — required to honour the
+    /// "durable local buffer" contract.
+    pub rocksdb_sync_writes: bool,
+
+    /// How many records compile_cf buffers per table before flushing the
+    /// batch through JSON→Arrow→Parquet. Larger values trade memory for
+    /// fewer arrow_json invocations. Default 1000.
+    pub flush_compile_batch_size: usize,
 }
 
 impl Config {
@@ -80,6 +90,19 @@ impl Config {
                 .unwrap_or(false),
             rocksdb_path: env::var("ROCKSDB_PATH")
                 .unwrap_or_else(|_| "/var/lib/rocksdb".to_string()),
+            rocksdb_sync_writes: env::var("ROCKSDB_SYNC_WRITES")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
+            flush_compile_batch_size: env::var("FLUSH_COMPILE_BATCH_SIZE")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("FLUSH_COMPILE_BATCH_SIZE must be a positive integer")
+                .and_then(|n: usize| {
+                    if n == 0 {
+                        anyhow::bail!("FLUSH_COMPILE_BATCH_SIZE must be > 0");
+                    }
+                    Ok(n)
+                })?,
         })
     }
 }

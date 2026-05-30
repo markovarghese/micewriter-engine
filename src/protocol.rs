@@ -24,8 +24,16 @@ pub struct RegisterSchema {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldDef {
     pub name: String,
-    /// Iceberg primitive type string: "string", "long", "int", "double",
-    /// "float", "boolean", "timestamptz", "timestamp", "date", "binary".
+    /// Iceberg primitive type string. Accepted values (see `field_type::MappedType`):
+    /// "string", "long" / "int64", "int" / "int32", "double" / "float64",
+    /// "float" / "float32", "boolean", "timestamptz", "timestamp", "date",
+    /// "binary" / "bytes". Unknown values are logged and treated as "string".
+    ///
+    /// Wire-format note for SDK authors: `timestamptz` values must be encoded
+    /// in CBOR as ISO-8601 strings with a numeric UTC offset (e.g.
+    /// `2026-05-30T07:30:02.123456Z` or `…+00:00`). Named timezones like
+    /// `"UTC"` are NOT accepted by the engine's arrow-json parser unless
+    /// arrow's `chrono-tz` feature is enabled.
     #[serde(rename = "type")]
     pub field_type: String,
     #[serde(default = "bool_true")]

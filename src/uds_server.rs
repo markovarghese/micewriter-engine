@@ -5,6 +5,7 @@ use anyhow::Result;
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::protocol::{
@@ -16,6 +17,11 @@ use crate::config::Config;
 pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
 
 const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024; // 128 MB
+const WRITE_BATCH_MAX: usize = 1000;
+
+/// One pending write: the raw payload bytes (including the 1-byte discriminant
+/// at offset 0) plus a oneshot the writer task uses to signal persistence.
+type WriteRequest = (Vec<u8>, oneshot::Sender<Result<(), String>>);
 
 /// Listen on `socket_path` and spawn a handler task for every incoming connection.
 ///
@@ -37,19 +43,47 @@ pub async fn run_server(
 
     let mut join_set = tokio::task::JoinSet::new();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100_000);
-    
+    let (tx, mut rx) = mpsc::channel::<WriteRequest>(100_000);
+
     let writer_store = Arc::clone(&store);
     let writer_handle = tokio::task::spawn_blocking(move || {
-        while let Some(payload) = rx.blocking_recv() {
-            if let Err(e) = writer_store.append(&payload[1..]) {
-                tracing::error!("RocksDB append error: {}", e);
-            }
-            while let Ok(more) = rx.try_recv() {
-                if let Err(e) = writer_store.append(&more[1..]) {
-                    tracing::error!("RocksDB append error: {}", e);
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_MAX);
+        let mut acks: Vec<oneshot::Sender<Result<(), String>>> = Vec::with_capacity(WRITE_BATCH_MAX);
+
+        while let Some((payload, ack)) = rx.blocking_recv() {
+            payloads.push(payload);
+            acks.push(ack);
+
+            // Opportunistically drain more pending writes into the same batch.
+            while payloads.len() < WRITE_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok((more_payload, more_ack)) => {
+                        payloads.push(more_payload);
+                        acks.push(more_ack);
+                    }
+                    Err(_) => break,
                 }
             }
+
+            // Strip the 1-byte discriminant from each payload before persisting.
+            let bodies: Vec<&[u8]> = payloads.iter().map(|p| &p[1..]).collect();
+            let result = writer_store.append_batch(&bodies);
+
+            match result {
+                Ok(_) => {
+                    for ack in acks.drain(..) {
+                        let _ = ack.send(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    tracing::error!("RocksDB batch append failed: {}", err_str);
+                    for ack in acks.drain(..) {
+                        let _ = ack.send(Err(err_str.clone()));
+                    }
+                }
+            }
+            payloads.clear();
         }
     });
 
@@ -96,7 +130,7 @@ pub async fn run_server(
 /// Read IPC frames from one connection until it closes.
 async fn handle_connection(
     mut stream: UnixStream,
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<WriteRequest>,
     registry: SchemaRegistry,
     config: Arc<Config>,
     flush_trigger: Arc<tokio::sync::Notify>,
@@ -173,34 +207,117 @@ fn handle_flush_now(config: &Config, flush_trigger: &tokio::sync::Notify) -> Ack
     }
 }
 
+/// Parse the header of an MSG_INGEST_RECORD body (everything after the
+/// 1-byte discriminant). Returns the table name and the byte offset where
+/// the CBOR payload begins. Extracted as a free function so it can be unit
+/// tested without spinning up sockets or RocksDB.
+fn parse_ingest_header(body: &[u8]) -> Result<(&str, usize), &'static str> {
+    if body.len() < 2 {
+        return Err("invalid ingest record payload");
+    }
+    let table_name_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + table_name_len {
+        return Err("payload too short for declared table name length");
+    }
+    let table_name = std::str::from_utf8(&body[2..2 + table_name_len])
+        .map_err(|_| "invalid utf-8 in table name")?;
+    Ok((table_name, 2 + table_name_len))
+}
+
 async fn handle_ingest_record(
     payload: Vec<u8>,
-    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: &mpsc::Sender<WriteRequest>,
     registry: &SchemaRegistry,
 ) -> AckResponse {
     let body = &payload[1..];
 
-    if body.len() < 2 {
-        return AckResponse::error("invalid ingest record payload");
-    }
-    
-    let table_name_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-    if body.len() < 2 + table_name_len + 4 {
-        return AckResponse::error("payload too short for table name and schema id");
-    }
-    
-    let table_name_bytes = &body[2..2 + table_name_len];
-    let table_name = match std::str::from_utf8(table_name_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => return AckResponse::error("invalid utf-8 in table name"),
+    let (table_name, _cbor_offset) = match parse_ingest_header(body) {
+        Ok(v) => v,
+        Err(msg) => return AckResponse::error(msg),
     };
+    let table_name = table_name.to_string();
 
     if !registry.read().unwrap().contains_key(&table_name) {
         return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", table_name));
     }
 
-    match tx.send(payload).await {
-        Ok(_) => AckResponse::ok(),
-        Err(_) => AckResponse::error("server shutting down"),
+    // Queue the write and wait for the writer task to confirm RocksDB persistence
+    // (including fsync, if enabled) before ACKing the SDK.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if tx.send((payload, ack_tx)).await.is_err() {
+        return AckResponse::error("server shutting down");
+    }
+
+    match ack_rx.await {
+        Ok(Ok(())) => AckResponse::ok(),
+        Ok(Err(e)) => AckResponse::error(format!("rocksdb write failed: {}", e)),
+        Err(_) => AckResponse::error("writer task terminated before ack"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ingest_header;
+
+    fn make_body(table_name: &[u8], cbor: &[u8]) -> Vec<u8> {
+        let len = table_name.len() as u16;
+        let mut body = Vec::with_capacity(2 + table_name.len() + cbor.len());
+        body.extend_from_slice(&len.to_be_bytes());
+        body.extend_from_slice(table_name);
+        body.extend_from_slice(cbor);
+        body
+    }
+
+    #[test]
+    fn parses_valid_header_with_cbor() {
+        let body = make_body(b"telemetry_events", &[0xA0]); // empty CBOR map
+        let (name, offset) = parse_ingest_header(&body).unwrap();
+        assert_eq!(name, "telemetry_events");
+        assert_eq!(offset, 2 + b"telemetry_events".len());
+        assert_eq!(&body[offset..], &[0xA0]);
+    }
+
+    #[test]
+    fn parses_minimal_one_byte_cbor() {
+        // CBOR null = single byte 0xF6. The old `+ 4` check would have
+        // rejected this; the fix must accept it.
+        let body = make_body(b"t", &[0xF6]);
+        let (name, offset) = parse_ingest_header(&body).unwrap();
+        assert_eq!(name, "t");
+        assert_eq!(&body[offset..], &[0xF6]);
+    }
+
+    #[test]
+    fn rejects_body_under_two_bytes() {
+        assert_eq!(parse_ingest_header(&[]), Err("invalid ingest record payload"));
+        assert_eq!(parse_ingest_header(&[0x00]), Err("invalid ingest record payload"));
+    }
+
+    #[test]
+    fn rejects_truncated_table_name() {
+        // Declares 10-byte name but provides only 3.
+        let body = vec![0x00, 0x0A, b'f', b'o', b'o'];
+        assert_eq!(
+            parse_ingest_header(&body),
+            Err("payload too short for declared table name length")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_table_name() {
+        // 0xFF is not valid UTF-8.
+        let body = make_body(&[0xFFu8, 0xFEu8], &[0xA0]);
+        assert_eq!(parse_ingest_header(&body), Err("invalid utf-8 in table name"));
+    }
+
+    #[test]
+    fn accepts_zero_length_table_name_but_loses_no_cbor() {
+        // Edge case: u16=0 means table_name is empty. Caller will reject via
+        // the schema registry lookup, but the parser itself should succeed.
+        let body = make_body(b"", &[0xA0]);
+        let (name, offset) = parse_ingest_header(&body).unwrap();
+        assert_eq!(name, "");
+        assert_eq!(offset, 2);
+        assert_eq!(&body[offset..], &[0xA0]);
     }
 }

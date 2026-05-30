@@ -1,7 +1,7 @@
 mod config;
+mod field_type;
 mod flush_engine;
 mod iceberg_writer;
-mod parquet_writer;
 mod protocol;
 mod rocksdb_store;
 mod uds_server;
@@ -24,13 +24,16 @@ async fn main() -> Result<()> {
     let config = Arc::new(config::Config::from_env()?);
     info!("mIceWriter Engine starting");
 
-    let store = Arc::new(rocksdb_store::RocksStore::open(&config.rocksdb_path)?);
+    let store = Arc::new(rocksdb_store::RocksStore::open(
+        &config.rocksdb_path,
+        config.rocksdb_sync_writes,
+    )?);
     let registry: uds_server::SchemaRegistry = Arc::new(RwLock::new(HashMap::new()));
     let iceberg_state = Arc::new(iceberg_writer::IcebergState::default());
 
     let flush_trigger = Arc::new(tokio::sync::Notify::new());
 
-    // Channel used to signal the UDS server to stop accepting new connections.
+    // Channel used to signal the UDS server and flush loop to stop.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn the UDS server.
@@ -39,9 +42,10 @@ async fn main() -> Result<()> {
     let uds_config = Arc::clone(&config);
     let uds_flush_trigger = Arc::clone(&flush_trigger);
     let uds_socket = config.socket_path.clone();
+    let uds_shutdown_rx = shutdown_rx.clone();
     let uds_handle = tokio::spawn(async move {
         if let Err(e) =
-            uds_server::run_server(&uds_socket, uds_store, uds_registry, uds_config, uds_flush_trigger, shutdown_rx).await
+            uds_server::run_server(&uds_socket, uds_store, uds_registry, uds_config, uds_flush_trigger, uds_shutdown_rx).await
         {
             tracing::error!("UDS server error: {:#}", e);
         }
@@ -53,8 +57,16 @@ async fn main() -> Result<()> {
     let flush_config = Arc::clone(&config);
     let flush_state = Arc::clone(&iceberg_state);
     let flush_loop_trigger = Arc::clone(&flush_trigger);
-    tokio::spawn(async move {
-        flush_engine::run_flush_loop(flush_store, flush_registry, flush_config, flush_state, flush_loop_trigger).await;
+    let flush_shutdown_rx = shutdown_rx.clone();
+    let flush_loop_handle = tokio::spawn(async move {
+        flush_engine::run_flush_loop(
+            flush_store,
+            flush_registry,
+            flush_config,
+            flush_state,
+            flush_loop_trigger,
+            flush_shutdown_rx,
+        ).await;
     });
 
     // Wait for SIGTERM (Kubernetes pod termination) or Ctrl+C (local dev).
@@ -62,11 +74,14 @@ async fn main() -> Result<()> {
 
     info!("Shutdown signal received — stopping UDS server and flushing remaining data");
 
-    // Stop the UDS server from accepting new connections.
+    // Tell the UDS server and the background flush loop to stop.
     let _ = shutdown_tx.send(true);
 
     info!("Waiting for active UDS connections to drain...");
     let _ = uds_handle.await;
+
+    info!("Waiting for background flush loop to finish...");
+    let _ = flush_loop_handle.await;
 
     // Emergency flush: drain anything in the active CF before exiting.
     if let Err(e) =

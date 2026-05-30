@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{NestedField, Schema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogBuilder};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{CatalogType, Config};
+use crate::field_type::MappedType;
 use crate::protocol::FieldDef;
 
 /// Process-lifetime caches to avoid redundant Glue/Nessie metadata API calls.
@@ -47,18 +48,18 @@ pub async fn flush_table(
     table_name: &str,
     namespace: &[String],
     parquet_bytes: Vec<u8>,
+    record_count: u64,
     field_defs: &[FieldDef],
-    config: &Config,
 ) -> Result<()> {
     if parquet_bytes.is_empty() {
         return Ok(());
     }
     match catalog {
         CatalogHandle::Glue(c) => {
-            do_flush_table(c, state, table_name, namespace, parquet_bytes, field_defs, config).await
+            do_flush_table(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
         }
         CatalogHandle::Nessie(c) => {
-            do_flush_table(c, state, table_name, namespace, parquet_bytes, field_defs, config).await
+            do_flush_table(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
         }
     }
 }
@@ -69,8 +70,8 @@ async fn do_flush_table<C: Catalog>(
     table_name: &str,
     namespace: &[String],
     parquet_bytes: Vec<u8>,
+    record_count: u64,
     field_defs: &[FieldDef],
-    _config: &Config,
 ) -> Result<()> {
     let ns_ident = NamespaceIdent::from_vec(namespace.to_vec())?;
     let table_ident = TableIdent::new(ns_ident.clone(), table_name.to_string());
@@ -134,7 +135,7 @@ async fn do_flush_table<C: Catalog>(
         .content(DataContentType::Data)
         .file_path(file_path)
         .file_format(DataFileFormat::Parquet)
-        .record_count(0)
+        .record_count(record_count)
         .file_size_in_bytes(parquet_bytes.len() as u64)
         .build()?;
 
@@ -230,11 +231,11 @@ fn build_iceberg_schema(fields: &[FieldDef]) -> Result<Schema> {
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let field_type = map_primitive_type(&f.field_type);
+            let primitive = MappedType::from_str_or_string(&f.field_type, &f.name).to_iceberg();
             if f.required {
-                NestedField::required(i as i32 + 1, &f.name, Type::Primitive(field_type))
+                NestedField::required(i as i32 + 1, &f.name, Type::Primitive(primitive))
             } else {
-                NestedField::optional(i as i32 + 1, &f.name, Type::Primitive(field_type))
+                NestedField::optional(i as i32 + 1, &f.name, Type::Primitive(primitive))
             }
         })
         .map(Arc::new)
@@ -244,20 +245,4 @@ fn build_iceberg_schema(fields: &[FieldDef]) -> Result<Schema> {
         .with_fields(nested)
         .build()
         .context("Failed to build Iceberg schema")
-}
-
-fn map_primitive_type(type_str: &str) -> PrimitiveType {
-    match type_str {
-        "string" => PrimitiveType::String,
-        "long" | "int64" => PrimitiveType::Long,
-        "int" | "int32" => PrimitiveType::Int,
-        "double" | "float64" => PrimitiveType::Double,
-        "float" | "float32" => PrimitiveType::Float,
-        "boolean" => PrimitiveType::Boolean,
-        "timestamptz" => PrimitiveType::Timestamptz,
-        "timestamp" => PrimitiveType::Timestamp,
-        "date" => PrimitiveType::Date,
-        "binary" | "bytes" => PrimitiveType::Binary,
-        _ => PrimitiveType::String,
-    }
 }
