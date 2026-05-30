@@ -18,6 +18,7 @@ rocksdb = "0.22"
 iceberg = "0.9"
 iceberg-catalog-rest = "0.9"
 iceberg-catalog-glue = "0.9"
+iceberg-storage-opendal = "0.9"
 
 # Columnar in-memory format and Parquet serialization
 arrow = "57"

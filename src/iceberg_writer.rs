@@ -201,6 +201,10 @@ async fn build_nessie_catalog(config: &Config) -> Result<RestCatalog> {
     props.insert("uri".to_string(), config.nessie_uri.clone().unwrap());
 
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
         .load("rest_catalog", props)
         .await?;
 
