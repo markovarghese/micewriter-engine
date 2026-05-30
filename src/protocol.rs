@@ -43,11 +43,10 @@ fn bool_true() -> bool {
 /// is structured as follows:
 ///   [table_name_len: u16] (2 bytes, big-endian)
 ///   [table_name_bytes]    (UTF-8 string)
-///   [schema_id: i32]      (4 bytes, big-endian)
-///   [Arrow IPC Stream]    (Remaining bytes, raw native Apache Arrow IPC stream format)
+///   [CBOR stream bytes]   (Remaining bytes, CBOR serialized payload)
 ///
 /// This eliminates the need for a JSON `IngestRecord` struct, as the engine
-/// passes the raw Arrow bytes directly to RocksDB and then directly to the Parquet compiler.
+/// passes the raw bytes directly to RocksDB.
 
 // ---------------------------------------------------------------------------
 // Outbound messages (Engine → Java SDK)

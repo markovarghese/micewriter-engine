@@ -18,6 +18,8 @@ pub struct RocksStore {
     active_cf: Arc<RwLock<String>>,
     /// Monotonically increasing record key (8-byte big-endian).
     counter: AtomicU64,
+    /// Leftover CFs from previous runs that failed to flush.
+    orphaned_cfs: Arc<RwLock<Vec<String>>>,
 }
 
 impl RocksStore {
@@ -40,21 +42,45 @@ impl RocksStore {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
 
-        // Determine which CF should be active (the most recently created one
-        // whose name doesn't start with "frozen_").
-        let active_name = cfs
-            .iter()
-            .filter(|n| !n.starts_with("frozen_"))
-            .last()
-            .cloned()
-            .unwrap_or_else(|| INITIAL_CF.to_string());
+        let mut active_name = INITIAL_CF.to_string();
+        let mut orphans = Vec::new();
+        let mut non_frozen = Vec::new();
 
-        info!(cf = %active_name, "RocksDB opened, active column family");
+        for n in &cfs {
+            if !n.starts_with("frozen_") && n != "default" {
+                non_frozen.push(n.clone());
+            }
+        }
+        
+        if let Some(last) = non_frozen.last() {
+            active_name = last.clone();
+            for n in non_frozen.iter().take(non_frozen.len() - 1) {
+                orphans.push(n.clone());
+            }
+        }
+
+        // Determine max key in the active CF to avoid overwriting un-flushed records.
+        let mut max_id: u64 = 0;
+        {
+            if let Some(cf) = db.cf_handle(&active_name) {
+                let mut iter = db.iterator_cf(&cf, rocksdb::IteratorMode::End);
+                if let Some(Ok((k, _))) = iter.next() {
+                    if k.len() == 8 {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&k);
+                        max_id = u64::from_be_bytes(buf);
+                    }
+                }
+            }
+        }
+
+        info!(cf = %active_name, orphans = orphans.len(), max_key = max_id, "RocksDB opened, active column family");
 
         Ok(Self {
             db: Arc::new(RwLock::new(db)),
             active_cf: Arc::new(RwLock::new(active_name)),
-            counter: AtomicU64::new(0),
+            counter: AtomicU64::new(max_id + 1),
+            orphaned_cfs: Arc::new(RwLock::new(orphans)),
         })
     }
 
@@ -77,7 +103,7 @@ impl RocksStore {
     ///
     /// The caller is responsible for flushing the records and then calling
     /// `drop_frozen_cf` once the Iceberg commit succeeds.
-    pub fn rotate(&self) -> Result<(String, Vec<Vec<u8>>)> {
+    pub fn rotate(&self) -> Result<String> {
         let frozen_name = {
             let mut active = self.active_cf.write().unwrap();
             let frozen = active.clone();
@@ -95,20 +121,33 @@ impl RocksStore {
 
         info!(frozen = %frozen_name, "Column family rotated");
 
-        // Drain all records from the now-frozen CF.
+        Ok(frozen_name)
+    }
+
+    /// Retrieve and clear the list of orphaned column families.
+    pub fn get_orphaned_cfs(&self) -> Vec<String> {
+        let mut orphans = self.orphaned_cfs.write().unwrap();
+        let result = orphans.clone();
+        orphans.clear();
+        result
+    }
+
+    /// Iterate over all records in a given column family without buffering them all in memory.
+    pub fn iterate_cf<F>(&self, name: &str, mut f: F) -> Result<()> 
+    where
+        F: FnMut(&[u8]) -> Result<()>
+    {
         let db_lock = self.db.read().unwrap();
         let cf = db_lock
-            .cf_handle(&frozen_name)
-            .ok_or_else(|| anyhow!("frozen CF '{}' not found", frozen_name))?;
-
-        let records = db_lock
-            .full_iterator_cf(&cf, rocksdb::IteratorMode::Start)
-            .map(|r| r.map(|(_, v)| v.to_vec()))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        info!(count = records.len(), frozen = %frozen_name, "Records drained from frozen CF");
-
-        Ok((frozen_name, records))
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("CF '{}' not found", name))?;
+            
+        let iter = db_lock.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (_, v) = item?;
+            f(&v)?;
+        }
+        Ok(())
     }
 
     /// Drop the frozen column family after a successful Iceberg commit.

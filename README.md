@@ -77,6 +77,19 @@ docker build -t micewriter-engine:latest .
 
 > **Note:** `cargo build` compiles RocksDB from C++ source on first run — expect 5–10 minutes. Subsequent builds use the cargo cache.
 
+### Local Development via Docker (Windows Host)
+If you don't have the Rust toolchain, C++ compiler, or `cmake` installed natively on your Windows host, you can leverage the existing `Dockerfile`'s builder stage to run `cargo` commands (like `cargo test` or `cargo clippy`).
+
+First, build the development image containing all the C++ dependencies:
+```powershell
+docker build --target builder -t micewriter-engine-dev .
+```
+
+Then, run your `cargo` commands inside an ephemeral container, mounting your source code so you don't lose the compiled cache:
+```powershell
+docker run --rm -it -v ${PWD}:/app -w /app micewriter-engine-dev cargo test
+```
+
 ## Iceberg Dependency Versions
 
 We use `iceberg-rust` v0.9+ for full native support of `fast_append` and FileIO operations without needing Python fallbacks.

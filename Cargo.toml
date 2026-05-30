@@ -22,11 +22,13 @@ iceberg-storage-opendal = "0.9"
 
 # Columnar in-memory format and Parquet serialization
 arrow = "57"
+arrow-json = "57"
 parquet = { version = "57", features = ["arrow"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ciborium = "0.2"
 
 # Randomness for flush jitter
 rand = "0.8"

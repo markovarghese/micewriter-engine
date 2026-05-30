@@ -37,17 +37,33 @@ pub async fn run_server(
 
     let mut join_set = tokio::task::JoinSet::new();
 
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100_000);
+    
+    let writer_store = Arc::clone(&store);
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        while let Some(payload) = rx.blocking_recv() {
+            if let Err(e) = writer_store.append(&payload[1..]) {
+                tracing::error!("RocksDB append error: {}", e);
+            }
+            while let Ok(more) = rx.try_recv() {
+                if let Err(e) = writer_store.append(&more[1..]) {
+                    tracing::error!("RocksDB append error: {}", e);
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _)) => {
-                        let store = Arc::clone(&store);
+                        let tx_clone = tx.clone();
                         let registry = Arc::clone(&registry);
                         let config = Arc::clone(&config);
                         let flush_trigger = Arc::clone(&flush_trigger);
                         join_set.spawn(async move {
-                            if let Err(e) = handle_connection(stream, store, registry, config, flush_trigger).await {
+                            if let Err(e) = handle_connection(stream, tx_clone, registry, config, flush_trigger).await {
                                 error!("Connection handler error: {:#}", e);
                             }
                         });
@@ -70,13 +86,17 @@ pub async fn run_server(
         }
     }
 
+    // Drop the sender so the writer loop will exit once the channel drains
+    drop(tx);
+    let _ = writer_handle.await;
+
     Ok(())
 }
 
 /// Read IPC frames from one connection until it closes.
 async fn handle_connection(
     mut stream: UnixStream,
-    store: Arc<RocksStore>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     registry: SchemaRegistry,
     config: Arc<Config>,
     flush_trigger: Arc<tokio::sync::Notify>,
@@ -108,7 +128,7 @@ async fn handle_connection(
 
         let ack = match msg_type {
             MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
-            MSG_INGEST_RECORD => handle_ingest_record(payload, store.clone(), &registry).await,
+            MSG_INGEST_RECORD => handle_ingest_record(payload, &tx, &registry).await,
             MSG_FLUSH_NOW => handle_flush_now(&config, &flush_trigger),
             other => {
                 warn!(byte = other, "Unknown message type");
@@ -155,7 +175,7 @@ fn handle_flush_now(config: &Config, flush_trigger: &tokio::sync::Notify) -> Ack
 
 async fn handle_ingest_record(
     payload: Vec<u8>,
-    store: Arc<RocksStore>,
+    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     registry: &SchemaRegistry,
 ) -> AckResponse {
     let body = &payload[1..];
@@ -179,20 +199,8 @@ async fn handle_ingest_record(
         return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", table_name));
     }
 
-    // Store the raw bytes so the flush engine can pass them to the Parquet Arrow IPC reader.
-    let res = tokio::task::spawn_blocking(move || {
-        store.append(&payload[1..])
-    }).await;
-
-    match res {
-        Ok(Ok(_)) => AckResponse::ok(),
-        Ok(Err(e)) => {
-            error!("RocksDB append error: {}", e);
-            AckResponse::error(e.to_string())
-        }
-        Err(e) => {
-            error!("Task join error: {}", e);
-            AckResponse::error("internal thread error")
-        }
+    match tx.send(payload).await {
+        Ok(_) => AckResponse::ok(),
+        Err(_) => AckResponse::error("server shutting down"),
     }
 }
