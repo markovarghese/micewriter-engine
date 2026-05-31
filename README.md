@@ -61,7 +61,7 @@ All frames use a **4-byte big-endian length prefix** followed by:
 
 ```powershell
 # Build the Docker image and push it to the local k3s registry
-.\push.ps1
+powershell -ExecutionPolicy Bypass -File .\push.ps1
 ```
 
 This is the only step needed when deploying to the k3s-on-Hyper-V home lab cluster.
