@@ -27,6 +27,8 @@ async fn main() -> Result<()> {
     let store = Arc::new(rocksdb_store::RocksStore::open(
         &config.rocksdb_path,
         config.rocksdb_sync_writes,
+        config.flush_size_bytes,
+        config.flush_size_jitter_bytes,
     )?);
     let registry: uds_server::SchemaRegistry = Arc::new(RwLock::new(HashMap::new()));
     let iceberg_state = Arc::new(iceberg_writer::IcebergState::default());

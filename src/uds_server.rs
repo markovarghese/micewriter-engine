@@ -17,7 +17,7 @@ use crate::config::Config;
 
 pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
 
-const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024; // 128 MB
+const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const WRITE_BATCH_MAX: usize = 1000;
 
 /// Edge-triggered backpressure state so we log once per transition instead of
@@ -52,6 +52,7 @@ pub async fn run_server(
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(100_000);
 
     let writer_store = Arc::clone(&store);
+    let writer_flush_trigger = Arc::clone(&flush_trigger);
     let writer_handle = tokio::task::spawn_blocking(move || {
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_MAX);
         let mut acks: Vec<oneshot::Sender<Result<(), String>>> = Vec::with_capacity(WRITE_BATCH_MAX);
@@ -76,7 +77,10 @@ pub async fn run_server(
             let result = writer_store.append_batch(&bodies);
 
             match result {
-                Ok(_) => {
+                Ok(should_flush) => {
+                    if should_flush {
+                        writer_flush_trigger.notify_one();
+                    }
                     for ack in acks.drain(..) {
                         let _ = ack.send(Ok(()));
                     }

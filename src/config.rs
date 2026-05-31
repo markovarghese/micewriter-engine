@@ -30,6 +30,11 @@ pub struct Config {
     /// Maximum random jitter added/subtracted from flush_interval_secs (default 120).
     pub flush_jitter_secs: u64,
 
+    /// Size limit in bytes for the active RocksDB column family before triggering a flush (default 192 MB).
+    pub flush_size_bytes: u64,
+    /// Maximum random jitter added/subtracted from flush_size_bytes (default 8 MB).
+    pub flush_size_jitter_bytes: u64,
+
     /// If true, the UDS server will accept MSG_FLUSH_NOW (0x03) from the SDK to force an immediate flush.
     pub enable_manual_flush: bool,
 
@@ -45,6 +50,10 @@ pub struct Config {
     /// batch through JSON→Arrow→Parquet. Larger values trade memory for
     /// fewer arrow_json invocations. Default 1000.
     pub flush_compile_batch_size: usize,
+
+    /// Maximum byte size of uncompressed CBOR records to buffer per table before
+    /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
+    pub flush_compile_batch_bytes: usize,
 
     /// Maximum number of retained frozen RocksDB column families before the
     /// engine starts rejecting ingest with a backpressure error. Each frozen
@@ -91,6 +100,14 @@ impl Config {
                 .unwrap_or_else(|_| "120".to_string())
                 .parse()
                 .context("FLUSH_JITTER_SECS must be a number")?,
+            flush_size_bytes: env::var("FLUSH_SIZE_BYTES")
+                .unwrap_or_else(|_| "33554432".to_string())
+                .parse()
+                .context("FLUSH_SIZE_BYTES must be a number")?,
+            flush_size_jitter_bytes: env::var("FLUSH_SIZE_JITTER_BYTES")
+                .unwrap_or_else(|_| "8388608".to_string())
+                .parse()
+                .context("FLUSH_SIZE_JITTER_BYTES must be a number")?,
             enable_manual_flush: env::var("ENABLE_MANUAL_FLUSH")
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -109,6 +126,10 @@ impl Config {
                     }
                     Ok(n)
                 })?,
+            flush_compile_batch_bytes: env::var("FLUSH_COMPILE_BATCH_BYTES")
+                .unwrap_or_else(|_| "4194304".to_string())
+                .parse()
+                .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()

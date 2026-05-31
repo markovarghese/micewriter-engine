@@ -96,9 +96,10 @@ pub async fn do_flush(
         // the blocking task aborts the flush for this CF so the records stay
         // in the frozen CF and can be retried on the next cycle.
         let batch_size = config.flush_compile_batch_size;
+        let batch_bytes_limit = config.flush_compile_batch_bytes;
         let compile_res: Result<HashMap<String, (Vec<u8>, u64)>> =
             tokio::task::spawn_blocking(move || {
-                compile_cf(&store_clone, &cf_clone, &schemas_clone, batch_size)
+                compile_cf(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes_limit)
             })
             .await
             .context("compile task panicked")?;
@@ -167,14 +168,17 @@ fn compile_cf(
     cf_name: &str,
     schemas: &HashMap<String, crate::protocol::RegisterSchema>,
     batch_size: usize,
+    batch_bytes_limit: usize,
 ) -> Result<HashMap<String, (Vec<u8>, u64)>> {
     let mut writers: HashMap<String, parquet::arrow::ArrowWriter<Vec<u8>>> = HashMap::new();
-    let mut buffers: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut buffers: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut row_trackers: HashMap<String, usize> = HashMap::new();
+    let mut buffer_bytes: HashMap<String, usize> = HashMap::new();
     let mut row_counts: HashMap<String, u64> = HashMap::new();
     let props = parquet::file::properties::WriterProperties::builder().build();
 
     let flush_buffer = |table_name: &str,
-                        buf: &mut Vec<serde_json::Value>,
+                        buf: &mut Vec<u8>,
                         writers: &mut HashMap<String, parquet::arrow::ArrowWriter<Vec<u8>>>,
                         row_counts: &mut HashMap<String, u64>|
      -> Result<()> {
@@ -202,15 +206,8 @@ fn compile_cf(
         }
         let writer = writers.get_mut(table_name).unwrap();
 
-        // arrow-json expects NDJSON (one object per line), not a JSON array.
-        let mut json_bytes: Vec<u8> = Vec::with_capacity(buf.len() * 128);
-        for value in buf.iter() {
-            serde_json::to_writer(&mut json_bytes, value)
-                .with_context(|| format!("serde_json::to_writer failed for '{}'", table_name))?;
-            json_bytes.push(b'\n');
-        }
         let reader = arrow_json::ReaderBuilder::new(arrow_schema)
-            .build(std::io::Cursor::new(json_bytes))
+            .build(std::io::Cursor::new(buf.as_slice()))
             .with_context(|| format!("arrow_json::ReaderBuilder failed for '{}'", table_name))?;
 
         for batch_result in reader {
@@ -222,6 +219,7 @@ fn compile_cf(
                 .with_context(|| format!("ArrowWriter::write failed for '{}'", table_name))?;
             *row_counts.entry(table_name.to_string()).or_insert(0) += rows;
         }
+        writer.flush().with_context(|| format!("ArrowWriter::flush failed for '{}'", table_name))?;
         buf.clear();
         Ok(())
     };
@@ -255,9 +253,22 @@ fn compile_cf(
                 };
 
             let buf = buffers.entry(table_name.clone()).or_default();
-            buf.push(value);
-            if buf.len() >= batch_size {
+            if let Err(e) = serde_json::to_writer(&mut *buf, &value) {
+                warn!(table = %table_name, "Failed to serialize JSON: {}", e);
+                return Ok(());
+            }
+            buf.push(b'\n');
+            
+            let row_tracker = row_trackers.entry(table_name.clone()).or_insert(0);
+            *row_tracker += 1;
+
+            let bytes_tracker = buffer_bytes.entry(table_name.clone()).or_insert(0);
+            *bytes_tracker += cbor_bytes.len();
+            
+            if *row_tracker >= batch_size || *bytes_tracker >= batch_bytes_limit {
                 flush_buffer(&table_name, buf, &mut writers, &mut row_counts)?;
+                *row_tracker = 0;
+                *bytes_tracker = 0;
             }
             Ok(())
         })

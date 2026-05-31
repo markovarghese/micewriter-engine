@@ -5,6 +5,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use tracing::info;
 
@@ -18,6 +19,13 @@ pub struct RocksStore {
     active_cf: Arc<RwLock<String>>,
     /// Monotonically increasing record key (8-byte big-endian).
     counter: AtomicU64,
+    /// Approximate uncompressed byte size of records in the active CF
+    active_cf_bytes: AtomicU64,
+    /// Current randomized flush size threshold
+    active_cf_size_limit: AtomicU64,
+    /// Base config values
+    flush_size_bytes: u64,
+    flush_size_jitter_bytes: u64,
     /// Frozen CFs awaiting a successful flush — both leftovers from a previous
     /// run and runtime-retained CFs whose Iceberg commit failed. Drained by
     /// `get_orphaned_cfs` at the start of each flush cycle and re-populated via
@@ -30,7 +38,7 @@ pub struct RocksStore {
 
 impl RocksStore {
     /// Open (or create) the RocksDB instance at `path`.
-    pub fn open(path: &str, sync_writes: bool) -> Result<Self> {
+    pub fn open(path: &str, sync_writes: bool, flush_size_bytes: u64, flush_size_jitter_bytes: u64) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -90,21 +98,26 @@ impl RocksStore {
 
         info!(cf = %active_name, orphans = orphans.len(), max_key = max_id, "RocksDB opened, active column family");
 
-        Ok(Self {
+        let store = Self {
             db: Arc::new(RwLock::new(db)),
             active_cf: Arc::new(RwLock::new(active_name)),
             counter: AtomicU64::new(max_id + 1),
+            active_cf_bytes: AtomicU64::new(0),
+            active_cf_size_limit: AtomicU64::new(0),
+            flush_size_bytes,
+            flush_size_jitter_bytes,
             orphaned_cfs: Arc::new(RwLock::new(orphans)),
             sync_writes,
-        })
+        };
+        store.reset_size_limit();
+        Ok(store)
     }
 
     /// Append a batch of serialised records to the active column family in a
-    /// single RocksDB WriteBatch. Returns Ok once RocksDB confirms the write
-    /// (and the OS fsync, if `sync_writes` is enabled).
-    pub fn append_batch(&self, values: &[&[u8]]) -> Result<()> {
+    /// single RocksDB WriteBatch. Returns Ok(true) if the byte limit was exceeded.
+    pub fn append_batch(&self, values: &[&[u8]]) -> Result<bool> {
         if values.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let cf_name = self.active_cf.read().unwrap().clone();
         let db_lock = self.db.read().unwrap();
@@ -113,7 +126,9 @@ impl RocksStore {
             .ok_or_else(|| anyhow!("CF '{}' not found", cf_name))?;
 
         let mut batch = WriteBatch::default();
+        let mut batch_bytes: u64 = 0;
         for value in values {
+            batch_bytes += value.len() as u64;
             let key = self.counter.fetch_add(1, Ordering::Relaxed).to_be_bytes();
             batch.put_cf(&cf, key, value);
         }
@@ -121,7 +136,11 @@ impl RocksStore {
         let mut wo = WriteOptions::default();
         wo.set_sync(self.sync_writes);
         db_lock.write_opt(batch, &wo)?;
-        Ok(())
+        
+        let new_size = self.active_cf_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
+        let limit = self.active_cf_size_limit.load(Ordering::Relaxed);
+
+        Ok(new_size >= limit)
     }
 
     /// Rotate the active CF:
@@ -143,12 +162,24 @@ impl RocksStore {
 
             self.db.write().unwrap().create_cf(&new_cf, &Options::default())?;
             *active = new_cf;
+            
+            self.active_cf_bytes.store(0, Ordering::Relaxed);
+            self.reset_size_limit();
+            
             frozen
         };
 
         info!(frozen = %frozen_name, "Column family rotated");
 
         Ok(frozen_name)
+    }
+
+    fn reset_size_limit(&self) {
+        let jitter = rand::thread_rng().gen_range(0..=(self.flush_size_jitter_bytes * 2));
+        let new_limit = self.flush_size_bytes
+            .saturating_add(jitter)
+            .saturating_sub(self.flush_size_jitter_bytes);
+        self.active_cf_size_limit.store(new_limit.max(1024 * 1024), Ordering::Relaxed);
     }
 
     /// Retrieve and clear the list of orphaned column families.
