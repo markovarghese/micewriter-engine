@@ -18,7 +18,11 @@ pub struct RocksStore {
     active_cf: Arc<RwLock<String>>,
     /// Monotonically increasing record key (8-byte big-endian).
     counter: AtomicU64,
-    /// Leftover CFs from previous runs that failed to flush.
+    /// Frozen CFs awaiting a successful flush — both leftovers from a previous
+    /// run and runtime-retained CFs whose Iceberg commit failed. Drained by
+    /// `get_orphaned_cfs` at the start of each flush cycle and re-populated via
+    /// `retain_frozen_cf` whenever a commit fails, so failed cycles are retried
+    /// without needing a pod restart.
     orphaned_cfs: Arc<RwLock<Vec<String>>>,
     /// If true, WriteBatch commits use `sync=true` so records hit disk before ACK.
     sync_writes: bool,
@@ -153,6 +157,20 @@ impl RocksStore {
         let result = orphans.clone();
         orphans.clear();
         result
+    }
+
+    /// Re-add a frozen CF to the retention list after a failed flush so it is
+    /// retried on the next cycle. The CF itself stays in RocksDB; only the
+    /// in-memory tracking is restored.
+    pub fn retain_frozen_cf(&self, name: String) {
+        self.orphaned_cfs.write().unwrap().push(name);
+    }
+
+    /// Snapshot count of currently retained frozen CFs. Hot-path safe — reads
+    /// take a brief RwLock read guard. Used by the ingest handler to apply
+    /// backpressure when flushes are persistently failing.
+    pub fn retained_cf_count(&self) -> usize {
+        self.orphaned_cfs.read().unwrap().len()
     }
 
     /// Iterate over all records in a given column family without buffering them all in memory.

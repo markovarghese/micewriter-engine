@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -18,6 +19,11 @@ pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
 
 const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024; // 128 MB
 const WRITE_BATCH_MAX: usize = 1000;
+
+/// Edge-triggered backpressure state so we log once per transition instead of
+/// once per rejected ingest. A loaded SDK can shed thousands of records per
+/// second when the catalog is down; per-rejection warnings would flood logs.
+static IN_BACKPRESSURE: AtomicBool = AtomicBool::new(false);
 
 /// One pending write: the raw payload bytes (including the 1-byte discriminant
 /// at offset 0) plus a oneshot the writer task uses to signal persistence.
@@ -96,8 +102,9 @@ pub async fn run_server(
                         let registry = Arc::clone(&registry);
                         let config = Arc::clone(&config);
                         let flush_trigger = Arc::clone(&flush_trigger);
+                        let store_clone = Arc::clone(&store);
                         join_set.spawn(async move {
-                            if let Err(e) = handle_connection(stream, tx_clone, registry, config, flush_trigger).await {
+                            if let Err(e) = handle_connection(stream, tx_clone, registry, config, flush_trigger, store_clone).await {
                                 error!("Connection handler error: {:#}", e);
                             }
                         });
@@ -134,6 +141,7 @@ async fn handle_connection(
     registry: SchemaRegistry,
     config: Arc<Config>,
     flush_trigger: Arc<tokio::sync::Notify>,
+    store: Arc<RocksStore>,
 ) -> Result<()> {
     loop {
         // --- Read frame header: 4-byte big-endian total message length ---
@@ -162,7 +170,10 @@ async fn handle_connection(
 
         let ack = match msg_type {
             MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
-            MSG_INGEST_RECORD => handle_ingest_record(payload, &tx, &registry).await,
+            MSG_INGEST_RECORD => {
+                handle_ingest_record(payload, &tx, &registry, &store, config.max_retained_frozen_cfs)
+                    .await
+            }
             MSG_FLUSH_NOW => handle_flush_now(&config, &flush_trigger),
             other => {
                 warn!(byte = other, "Unknown message type");
@@ -228,6 +239,8 @@ async fn handle_ingest_record(
     payload: Vec<u8>,
     tx: &mpsc::Sender<WriteRequest>,
     registry: &SchemaRegistry,
+    store: &RocksStore,
+    max_retained_frozen_cfs: usize,
 ) -> AckResponse {
     let body = &payload[1..];
 
@@ -239,6 +252,30 @@ async fn handle_ingest_record(
 
     if !registry.read().unwrap().contains_key(&table_name) {
         return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", table_name));
+    }
+
+    // Backpressure: if too many frozen CFs are pending flush, stop accepting
+    // new ingest so RocksDB cannot grow without bound until the catalog is
+    // healthy again. Returning a structured error lets the SDK distinguish
+    // this from a transport failure.
+    if max_retained_frozen_cfs > 0 {
+        let retained = store.retained_cf_count();
+        if retained >= max_retained_frozen_cfs {
+            if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
+                warn!(
+                    retained,
+                    threshold = max_retained_frozen_cfs,
+                    "Engine entering backpressure — rejecting ingest until flush recovers"
+                );
+            }
+            return AckResponse::error(format!(
+                "engine in backpressure: {} frozen CFs pending flush (threshold {})",
+                retained, max_retained_frozen_cfs
+            ));
+        }
+        if IN_BACKPRESSURE.swap(false, Ordering::Relaxed) {
+            info!(retained, "Engine exiting backpressure — accepting ingest");
+        }
     }
 
     // Queue the write and wait for the writer task to confirm RocksDB persistence

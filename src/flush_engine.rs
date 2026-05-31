@@ -152,7 +152,8 @@ pub async fn do_flush(
             let cf_clone = cf.clone();
             tokio::task::spawn_blocking(move || store_clone.drop_frozen_cf(&cf_clone)).await??;
         } else {
-            warn!(cf = %cf, "Some tables failed — frozen CF retained for later recovery");
+            store.retain_frozen_cf(cf.clone());
+            warn!(cf = %cf, retained = store.retained_cf_count(), "Some tables failed — frozen CF retained for later recovery");
         }
     }
 
