@@ -54,12 +54,6 @@ pub struct Config {
     /// Maximum byte size of uncompressed CBOR records to buffer per table before
     /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
     pub flush_compile_batch_bytes: usize,
-
-    /// Maximum number of retained frozen RocksDB column families before the
-    /// engine starts rejecting ingest with a backpressure error. Each frozen
-    /// CF represents one failed flush cycle, so this is effectively a cap on
-    /// consecutive flush failures. Default 3; set to 0 to disable backpressure.
-    pub max_retained_frozen_cfs: usize,
 }
 
 impl Config {
@@ -130,10 +124,6 @@ impl Config {
                 .unwrap_or_else(|_| "4194304".to_string())
                 .parse()
                 .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
-            max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .context("MAX_RETAINED_FROZEN_CFS must be a non-negative integer")?,
         })
     }
 }

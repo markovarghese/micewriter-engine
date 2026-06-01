@@ -49,7 +49,7 @@ pub async fn run_server(
 
     let mut join_set = tokio::task::JoinSet::new();
 
-    let (tx, mut rx) = mpsc::channel::<WriteRequest>(100_000);
+    let (tx, mut rx) = mpsc::channel::<WriteRequest>(4);
 
     let writer_store = Arc::clone(&store);
     let writer_flush_trigger = Arc::clone(&flush_trigger);
@@ -178,7 +178,7 @@ async fn handle_connection(
         let ack = match msg_type {
             MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
             MSG_INGEST_RECORD => {
-                handle_ingest_record(payload, &tx, &registry, &store, config.max_retained_frozen_cfs)
+                handle_ingest_record(payload, &tx, &registry, &store, &config)
                     .await
             }
             MSG_FLUSH_NOW => handle_flush_now(&config, &flush_trigger),
@@ -247,7 +247,7 @@ async fn handle_ingest_record(
     tx: &mpsc::Sender<WriteRequest>,
     registry: &SchemaRegistry,
     store: &RocksStore,
-    max_retained_frozen_cfs: usize,
+    config: &Config,
 ) -> AckResponse {
     let body = &payload[1..];
 
@@ -261,35 +261,39 @@ async fn handle_ingest_record(
         return AckResponse::error(format!("unknown table '{}' — send REGISTER_SCHEMA first", table_name));
     }
 
-    // Backpressure: if too many frozen CFs are pending flush, stop accepting
-    // new ingest so RocksDB cannot grow without bound until the catalog is
-    // healthy again. Returning a structured error lets the SDK distinguish
-    // this from a transport failure.
-    if max_retained_frozen_cfs > 0 {
-        let retained = store.retained_cf_count();
-        if retained >= max_retained_frozen_cfs {
-            if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
-                warn!(
-                    retained,
-                    threshold = max_retained_frozen_cfs,
-                    "Engine entering backpressure — rejecting ingest until flush recovers"
-                );
-            }
-            return AckResponse::error(format!(
-                "engine in backpressure: {} frozen CFs pending flush (threshold {})",
-                retained, max_retained_frozen_cfs
-            ));
+    // Backpressure: enforce a strict global limit on the exact byte size of all
+    // uncompiled records (both in the active CF and any pending frozen CFs).
+    // This prevents runaway queues and OOM crashes if the flush loop falls behind.
+    let unflushed_bytes = store.total_unflushed_bytes();
+    let max_unflushed_bytes = config.flush_size_bytes;
+    
+    if unflushed_bytes > max_unflushed_bytes {
+        if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
+            warn!(
+                bytes = unflushed_bytes,
+                limit = max_unflushed_bytes,
+                "Engine entering backpressure — rejecting ingest to protect memory limits"
+            );
         }
-        if IN_BACKPRESSURE.swap(false, Ordering::Relaxed) {
-            info!(retained, "Engine exiting backpressure — accepting ingest");
-        }
+        return AckResponse::error(format!(
+            "engine in backpressure: total unflushed bytes ({}) exceeds hard limit ({})",
+            unflushed_bytes, max_unflushed_bytes
+        ));
+    }
+    
+    if IN_BACKPRESSURE.swap(false, Ordering::Relaxed) {
+        info!(bytes = unflushed_bytes, "Engine exiting backpressure — accepting ingest");
     }
 
     // Queue the write and wait for the writer task to confirm RocksDB persistence
     // (including fsync, if enabled) before ACKing the SDK.
     let (ack_tx, ack_rx) = oneshot::channel();
-    if tx.send((payload, ack_tx)).await.is_err() {
-        return AckResponse::error("server shutting down");
+    match tx.try_send((payload, ack_tx)) {
+        Ok(_) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return AckResponse::error("engine in backpressure: write queue full");
+        }
+        Err(_) => return AckResponse::error("server shutting down"),
     }
 
     match ack_rx.await {

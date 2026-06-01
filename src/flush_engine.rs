@@ -97,12 +97,10 @@ pub async fn do_flush(
         // in the frozen CF and can be retried on the next cycle.
         let batch_size = config.flush_compile_batch_size;
         let batch_bytes_limit = config.flush_compile_batch_bytes;
-        let compile_res: Result<HashMap<String, (Vec<u8>, u64)>> =
-            tokio::task::spawn_blocking(move || {
-                compile_cf(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes_limit)
-            })
-            .await
-            .context("compile task panicked")?;
+        let handle = tokio::task::spawn_blocking(move || {
+            compile_cf(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes_limit)
+        });
+        let compile_res: Result<HashMap<String, (Vec<u8>, u64)>> = handle.await.context("compile task panicked")?;
 
         let results = match compile_res {
             Ok(r) => r,
@@ -175,7 +173,9 @@ fn compile_cf(
     let mut row_trackers: HashMap<String, usize> = HashMap::new();
     let mut buffer_bytes: HashMap<String, usize> = HashMap::new();
     let mut row_counts: HashMap<String, u64> = HashMap::new();
-    let props = parquet::file::properties::WriterProperties::builder().build();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
 
     let flush_buffer = |table_name: &str,
                         buf: &mut Vec<u8>,
@@ -224,7 +224,6 @@ fn compile_cf(
         Ok(())
     };
 
-    // iterate_cf takes a callback returning anyhow::Result; if flush_buffer fails
     // we propagate the real error through it directly.
     store
         .iterate_cf(cf_name, |record_bytes| {
@@ -277,8 +276,11 @@ fn compile_cf(
     // Drain remaining partial buffers.
     let table_names: Vec<String> = buffers.keys().cloned().collect();
     for table_name in table_names {
-        let mut buf = buffers.remove(&table_name).unwrap();
-        flush_buffer(&table_name, &mut buf, &mut writers, &mut row_counts)?;
+        if let Some(mut buf) = buffers.remove(&table_name) {
+            if !buf.is_empty() {
+                flush_buffer(&table_name, &mut buf, &mut writers, &mut row_counts)?;
+            }
+        }
     }
 
     let mut out = HashMap::new();

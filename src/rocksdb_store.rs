@@ -3,6 +3,7 @@ use std::sync::{
     Arc, RwLock,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
@@ -34,6 +35,10 @@ pub struct RocksStore {
     orphaned_cfs: Arc<RwLock<Vec<String>>>,
     /// If true, WriteBatch commits use `sync=true` so records hit disk before ACK.
     sync_writes: bool,
+    /// Global exact count of uncompiled bytes across all CFs
+    total_unflushed_bytes: AtomicU64,
+    /// Exact sizes of each frozen CF
+    frozen_cf_sizes: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl RocksStore {
@@ -42,6 +47,9 @@ impl RocksStore {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_bytes_per_sync(1048576);
+        db_opts.set_use_direct_reads(true);
+        db_opts.set_use_direct_io_for_flush_and_compaction(true);
 
         // List existing CFs so we re-open them all; RocksDB requires it.
         let cfs = match DB::list_cf(&db_opts, path) {
@@ -49,9 +57,13 @@ impl RocksStore {
             Err(_) => vec![INITIAL_CF.to_string()],
         };
 
+        let mut cf_opts = Options::default();
+        cf_opts.set_write_buffer_size(4 * 1024 * 1024);
+        cf_opts.set_max_write_buffer_number(2);
+
         let cf_descriptors: Vec<_> = cfs
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(name, cf_opts.clone()))
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
@@ -98,6 +110,13 @@ impl RocksStore {
 
         info!(cf = %active_name, orphans = orphans.len(), max_key = max_id, "RocksDB opened, active column family");
 
+        // Set initial total_unflushed_bytes by estimating orphans at flush_size_bytes
+        let total_unflushed = orphans.len() as u64 * flush_size_bytes;
+        let mut frozen_sizes = HashMap::new();
+        for orphan in &orphans {
+            frozen_sizes.insert(orphan.clone(), flush_size_bytes);
+        }
+
         let store = Self {
             db: Arc::new(RwLock::new(db)),
             active_cf: Arc::new(RwLock::new(active_name)),
@@ -108,6 +127,8 @@ impl RocksStore {
             flush_size_jitter_bytes,
             orphaned_cfs: Arc::new(RwLock::new(orphans)),
             sync_writes,
+            total_unflushed_bytes: AtomicU64::new(total_unflushed),
+            frozen_cf_sizes: Arc::new(RwLock::new(frozen_sizes)),
         };
         store.reset_size_limit();
         Ok(store)
@@ -138,6 +159,8 @@ impl RocksStore {
         db_lock.write_opt(batch, &wo)?;
         
         let new_size = self.active_cf_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
+        self.total_unflushed_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+        
         let limit = self.active_cf_size_limit.load(Ordering::Relaxed);
 
         Ok(new_size >= limit)
@@ -160,10 +183,14 @@ impl RocksStore {
                 .as_secs();
             let new_cf = format!("active_{}", ts);
 
-            self.db.write().unwrap().create_cf(&new_cf, &Options::default())?;
+            let mut cf_opts = Options::default();
+            cf_opts.set_write_buffer_size(4 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(2);
+            self.db.write().unwrap().create_cf(&new_cf, &cf_opts)?;
             *active = new_cf;
             
-            self.active_cf_bytes.store(0, Ordering::Relaxed);
+            let frozen_bytes = self.active_cf_bytes.swap(0, Ordering::Relaxed);
+            self.frozen_cf_sizes.write().unwrap().insert(frozen.clone(), frozen_bytes);
             self.reset_size_limit();
             
             frozen
@@ -225,8 +252,18 @@ impl RocksStore {
     /// Drop the frozen column family after a successful Iceberg commit.
     pub fn drop_frozen_cf(&self, name: &str) -> Result<()> {
         self.db.write().unwrap().drop_cf(name)?;
+        
+        if let Some(size) = self.frozen_cf_sizes.write().unwrap().remove(name) {
+            self.total_unflushed_bytes.fetch_sub(size, Ordering::Relaxed);
+        }
+        
         info!(cf = %name, "Frozen CF dropped");
         Ok(())
+    }
+
+    /// Global total of unflushed bytes across all active and frozen CFs.
+    pub fn total_unflushed_bytes(&self) -> u64 {
+        self.total_unflushed_bytes.load(Ordering::Relaxed)
     }
 }
 

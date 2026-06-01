@@ -124,10 +124,11 @@ async fn do_flush_table<C: Catalog>(
     let file_io = table.file_io();
     let output = file_io.new_output(&file_path)?;
     let mut writer = output.writer().await?;
-    writer.write(parquet_bytes.clone().into()).await?;
+    let bytes_len = parquet_bytes.len();
+    writer.write(parquet_bytes.into()).await?;
     writer.close().await?;
 
-    info!(path = %file_path, bytes = parquet_bytes.len(), "Parquet file uploaded to S3");
+    info!(path = %file_path, bytes = bytes_len, "Parquet file uploaded to S3");
 
     // Build the DataFile descriptor.
     use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
@@ -136,7 +137,7 @@ async fn do_flush_table<C: Catalog>(
         .file_path(file_path)
         .file_format(DataFileFormat::Parquet)
         .record_count(record_count)
-        .file_size_in_bytes(parquet_bytes.len() as u64)
+        .file_size_in_bytes(bytes_len as u64)
         .build()?;
 
     // Commit with exponential backoff on optimistic locking conflicts.

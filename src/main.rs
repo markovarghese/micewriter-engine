@@ -22,6 +22,8 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Arc::new(config::Config::from_env()?);
+
+
     info!("mIceWriter Engine starting");
 
     let store = Arc::new(rocksdb_store::RocksStore::open(
