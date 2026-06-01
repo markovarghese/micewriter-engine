@@ -58,13 +58,16 @@ pub async fn run_server(
         let mut acks: Vec<oneshot::Sender<Result<(), String>>> = Vec::with_capacity(WRITE_BATCH_MAX);
 
         while let Some((payload, ack)) = rx.blocking_recv() {
+            let mut batch_bytes = payload.len();
             payloads.push(payload);
             acks.push(ack);
 
             // Opportunistically drain more pending writes into the same batch.
-            while payloads.len() < WRITE_BATCH_MAX {
+            // Limit by both count and total bytes to prevent OOM on large payloads.
+            while payloads.len() < WRITE_BATCH_MAX && batch_bytes < MAX_PAYLOAD_SIZE {
                 match rx.try_recv() {
                     Ok((more_payload, more_ack)) => {
+                        batch_bytes += more_payload.len();
                         payloads.push(more_payload);
                         acks.push(more_ack);
                     }
