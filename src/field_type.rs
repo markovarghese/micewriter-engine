@@ -5,11 +5,12 @@
 //! `FieldDef` list, so they MUST resolve identical types for every field.
 //! Keeping the mapping here prevents the two modules from drifting.
 
-use arrow::datatypes::{DataType, TimeUnit};
-use iceberg::spec::PrimitiveType;
+use arrow::datatypes::{DataType, Field, TimeUnit};
+use iceberg::spec::{PrimitiveType, Type};
 use tracing::warn;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappedType {
     String,
     Long,
@@ -21,6 +22,7 @@ pub enum MappedType {
     Timestamp,
     Date,
     Binary,
+    List(Box<MappedType>),
 }
 
 impl MappedType {
@@ -38,6 +40,10 @@ impl MappedType {
             "timestamp" => Some(Self::Timestamp),
             "date" => Some(Self::Date),
             "binary" | "bytes" => Some(Self::Binary),
+            _ if s.starts_with("list(") && s.ends_with(")") => {
+                let inner_s = &s[5..s.len() - 1];
+                Self::from_str(inner_s).map(|t| Self::List(Box::new(t)))
+            }
             _ => None,
         }
     }
@@ -69,21 +75,30 @@ impl MappedType {
             Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
             Self::Date => DataType::Date32,
             Self::Binary => DataType::Binary,
+            Self::List(inner) => DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true))),
         }
     }
 
-    pub fn to_iceberg(self) -> PrimitiveType {
+    pub fn to_iceberg(self, next_id: &mut i32) -> Type {
         match self {
-            Self::String => PrimitiveType::String,
-            Self::Long => PrimitiveType::Long,
-            Self::Int => PrimitiveType::Int,
-            Self::Double => PrimitiveType::Double,
-            Self::Float => PrimitiveType::Float,
-            Self::Boolean => PrimitiveType::Boolean,
-            Self::TimestampTz => PrimitiveType::Timestamptz,
-            Self::Timestamp => PrimitiveType::Timestamp,
-            Self::Date => PrimitiveType::Date,
-            Self::Binary => PrimitiveType::Binary,
+            Self::String => Type::Primitive(PrimitiveType::String),
+            Self::Long => Type::Primitive(PrimitiveType::Long),
+            Self::Int => Type::Primitive(PrimitiveType::Int),
+            Self::Double => Type::Primitive(PrimitiveType::Double),
+            Self::Float => Type::Primitive(PrimitiveType::Float),
+            Self::Boolean => Type::Primitive(PrimitiveType::Boolean),
+            Self::TimestampTz => Type::Primitive(PrimitiveType::Timestamptz),
+            Self::Timestamp => Type::Primitive(PrimitiveType::Timestamp),
+            Self::Date => Type::Primitive(PrimitiveType::Date),
+            Self::Binary => Type::Primitive(PrimitiveType::Binary),
+            Self::List(inner) => {
+                let inner_type = inner.to_iceberg(next_id);
+                let element_id = *next_id;
+                *next_id += 1;
+                Type::List(iceberg::spec::ListType {
+                    element_field: std::sync::Arc::new(iceberg::spec::NestedField::optional(element_id, "element", inner_type)),
+                })
+            }
         }
     }
 }
@@ -105,6 +120,8 @@ mod tests {
             ("timestamp", MappedType::Timestamp),
             ("date", MappedType::Date),
             ("binary", MappedType::Binary),
+            ("list(double)", MappedType::List(Box::new(MappedType::Double))),
+            ("list(string)", MappedType::List(Box::new(MappedType::String))),
         ];
         for (s, expected) in pairs {
             assert_eq!(MappedType::from_str(s), Some(expected), "primary alias '{}' failed", s);
@@ -155,11 +172,13 @@ mod tests {
             MappedType::Timestamp,
             MappedType::Date,
             MappedType::Binary,
+            MappedType::List(Box::new(MappedType::Double)),
         ];
         for t in all {
             // Just call both — failures here mean the impl panicked.
             let _ = t.to_arrow();
-            let _ = t.to_iceberg();
+            let mut next_id = 1;
+            let _ = t.to_iceberg(&mut next_id);
         }
     }
 
