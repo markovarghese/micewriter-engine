@@ -54,6 +54,9 @@ pub struct Config {
     /// Maximum byte size of uncompressed CBOR records to buffer per table before
     /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
     pub flush_compile_batch_bytes: usize,
+
+    /// Reject ingest with backpressure error once this many frozen CFs are pending flush. Default 3.
+    pub max_retained_frozen_cfs: usize,
 }
 
 impl Config {
@@ -124,6 +127,10 @@ impl Config {
                 .unwrap_or_else(|_| "4194304".to_string())
                 .parse()
                 .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
+            max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()
+                .context("MAX_RETAINED_FROZEN_CFS must be a positive integer")?,
         })
     }
 }

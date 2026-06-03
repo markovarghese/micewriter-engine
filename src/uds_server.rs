@@ -265,7 +265,7 @@ async fn handle_ingest_record(
     // uncompiled records (both in the active CF and any pending frozen CFs).
     // This prevents runaway queues and OOM crashes if the flush loop falls behind.
     let unflushed_bytes = store.total_unflushed_bytes();
-    let max_unflushed_bytes = config.flush_size_bytes;
+    let max_unflushed_bytes = config.flush_size_bytes * (1 + config.max_retained_frozen_cfs as u64);
     
     if unflushed_bytes > max_unflushed_bytes {
         if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
