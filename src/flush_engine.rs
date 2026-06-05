@@ -82,71 +82,96 @@ pub async fn do_flush(
     }).await??;
     cfs_to_flush.push(frozen_cf);
 
-    let catalog = iceberg_writer::build_catalog(config).await?;
+    let catalog = match iceberg_writer::build_catalog(config).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to build catalog: {:#}", e);
+            return Err(e);
+        }
+    };
     let schemas = registry.read().unwrap().clone();
 
     for cf in cfs_to_flush {
         info!(cf = %cf, "Flushing CF");
         let store_clone = Arc::clone(&store);
         let cf_clone = cf.clone();
+        let batch_size = config.flush_compile_batch_size;
+        let batch_bytes = config.flush_compile_batch_bytes;
         let schemas_clone = schemas.clone();
 
-        // Stream records, parsing CBOR to JSON values and batching them to
-        // ArrowWriter to prevent memory spikes. Any conversion error inside
-        // the blocking task aborts the flush for this CF so the records stay
-        // in the frozen CF and can be retried on the next cycle.
-        let batch_size = config.flush_compile_batch_size;
-        let batch_bytes_limit = config.flush_compile_batch_bytes;
-        let handle = tokio::task::spawn_blocking(move || {
-            compile_cf(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes_limit)
-        });
-        let compile_res: Result<HashMap<String, (Vec<u8>, u64)>> = handle.await.context("compile task panicked")?;
+        let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>, u64)>(16);
 
-        let results = match compile_res {
-            Ok(r) => r,
+        // Spawn Stage 1, 2, 3 in a blocking thread (Reader, Parsers, Compressor)
+        let compile_handle = tokio::task::spawn_blocking(move || {
+            compile_cf_pipeline(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes, upload_tx)
+        });
+
+        // Stage 4: Uploader (Async I/O)
+        let mut upload_join_set = tokio::task::JoinSet::new();
+        while let Some((table_name, parquet_bytes, row_count)) = upload_rx.recv().await {
+            let schema = match schemas.get(&table_name) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let catalog_clone = Arc::clone(&catalog);
+            let state_clone = state.clone();
+
+            upload_join_set.spawn(async move {
+                let res = iceberg_writer::upload_parquet_chunk(
+                    &catalog_clone,
+                    &state_clone,
+                    &table_name,
+                    &schema.namespace,
+                    parquet_bytes,
+                    row_count,
+                    &schema.fields,
+                ).await;
+                (table_name, res)
+            });
+        }
+
+        let mut table_data_files: HashMap<String, Vec<iceberg::spec::DataFile>> = HashMap::new();
+        while let Some(res) = upload_join_set.join_next().await {
+            if let Ok((table_name, upload_res)) = res {
+                match upload_res {
+                    Ok(data_file) => table_data_files.entry(table_name).or_default().push(data_file),
+                    Err(e) => error!(table = %table_name, "Failed to upload Parquet chunk: {:#}", e),
+                }
+            }
+        }
+
+        // Wait for compilation to completely finish
+        let compile_res = compile_handle.await.context("compile task panicked")?;
+        let commit_all_ok = match compile_res {
+            Ok(_) => true,
             Err(e) => {
                 error!(cf = %cf, "Failed to compile CF, retaining for later: {:#}", e);
-                continue;
+                false
             }
         };
 
-        if results.is_empty() {
-            info!(cf = %cf, "Nothing to flush");
-            let store_clone = Arc::clone(&store);
-            let cf_clone = cf.clone();
-            tokio::task::spawn_blocking(move || store_clone.drop_frozen_cf(&cf_clone)).await??;
-            continue;
-        }
-
-        let mut commit_all_ok = true;
-        for (table_name, (parquet_bytes, row_count)) in results {
-            let schema = match schemas.get(&table_name) {
-                Some(s) => s,
-                None => {
-                    warn!(table = %table_name, "No schema registered, skipping table");
-                    commit_all_ok = false;
-                    continue;
-                }
-            };
-
-            match iceberg_writer::flush_table(
-                &catalog,
-                state,
-                &table_name,
-                &schema.namespace,
-                parquet_bytes,
-                row_count,
-                &schema.fields,
-            ).await {
-                Ok(_) => info!(table = %table_name, rows = row_count, "Table flushed"),
-                Err(e) => {
-                    error!(table = %table_name, "Table flush failed: {:#}", e);
-                    commit_all_ok = false;
+        // If compilation was successful, commit all data files
+        let mut fully_committed = commit_all_ok;
+        if commit_all_ok {
+            for (table_name, data_files) in table_data_files {
+                if data_files.is_empty() { continue; }
+                let schema = schemas.get(&table_name).unwrap();
+                
+                if let Err(e) = iceberg_writer::commit_data_files(
+                    &catalog,
+                    state,
+                    &table_name,
+                    &schema.namespace,
+                    data_files,
+                    &schema.fields,
+                ).await {
+                    error!(table = %table_name, "Table commit failed: {:#}", e);
+                    fully_committed = false;
                 }
             }
         }
 
-        if commit_all_ok {
+        if fully_committed {
             let store_clone = Arc::clone(&store);
             let cf_clone = cf.clone();
             tokio::task::spawn_blocking(move || store_clone.drop_frozen_cf(&cf_clone)).await??;
@@ -159,139 +184,153 @@ pub async fn do_flush(
     Ok(())
 }
 
-/// Compile every record in `cf_name` into per-table Parquet bytes and row counts.
-/// Runs inside `spawn_blocking` because it does synchronous RocksDB and Parquet IO.
-fn compile_cf(
+fn compile_cf_pipeline(
     store: &RocksStore,
     cf_name: &str,
     schemas: &HashMap<String, crate::protocol::RegisterSchema>,
     batch_size: usize,
-    batch_bytes_limit: usize,
-) -> Result<HashMap<String, (Vec<u8>, u64)>> {
-    let mut writers: HashMap<String, parquet::arrow::ArrowWriter<Vec<u8>>> = HashMap::new();
-    let mut buffers: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut row_trackers: HashMap<String, usize> = HashMap::new();
-    let mut buffer_bytes: HashMap<String, usize> = HashMap::new();
-    let mut row_counts: HashMap<String, u64> = HashMap::new();
-    let props = parquet::file::properties::WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
+    batch_bytes: usize,
+    upload_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>, u64)>,
+) -> Result<()> {
+    // Stage 1 & 2: Reader & Parsers
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(16);
+    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>)>(16);
+    let chunk_rx = Arc::new(std::sync::Mutex::new(chunk_rx));
 
-    let flush_buffer = |table_name: &str,
-                        buf: &mut Vec<u8>,
-                        writers: &mut HashMap<String, parquet::arrow::ArrowWriter<Vec<u8>>>,
-                        row_counts: &mut HashMap<String, u64>|
-     -> Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        let schema_def = match schemas.get(table_name) {
-            Some(s) => s,
-            None => {
-                warn!(table = %table_name, "Dropping records — no schema registered");
-                buf.clear();
-                return Ok(());
-            }
-        };
-        let arrow_schema = build_arrow_schema(&schema_def.fields);
-
-        if !writers.contains_key(table_name) {
-            let w = parquet::arrow::ArrowWriter::try_new(
-                vec![],
-                arrow_schema.clone(),
-                Some(props.clone()),
-            )
-            .with_context(|| format!("ArrowWriter::try_new failed for '{}'", table_name))?;
-            writers.insert(table_name.to_string(), w);
-        }
-        let writer = writers.get_mut(table_name).unwrap();
-
-        let reader = arrow_json::ReaderBuilder::new(arrow_schema)
-            .build(std::io::Cursor::new(buf.as_slice()))
-            .with_context(|| format!("arrow_json::ReaderBuilder failed for '{}'", table_name))?;
-
-        for batch_result in reader {
-            let batch = batch_result
-                .with_context(|| format!("arrow_json batch read failed for '{}'", table_name))?;
-            let rows = batch.num_rows() as u64;
-            writer
-                .write(&batch)
-                .with_context(|| format!("ArrowWriter::write failed for '{}'", table_name))?;
-            *row_counts.entry(table_name.to_string()).or_insert(0) += rows;
-        }
-        writer.flush().with_context(|| format!("ArrowWriter::flush failed for '{}'", table_name))?;
-        buf.clear();
-        Ok(())
-    };
-
-    // we propagate the real error through it directly.
-    store
-        .iterate_cf(cf_name, |record_bytes| {
-            if record_bytes.len() < 2 {
-                return Ok(());
-            }
-            let table_name_len = u16::from_be_bytes([record_bytes[0], record_bytes[1]]) as usize;
-            if record_bytes.len() < 2 + table_name_len {
-                return Ok(());
-            }
-
-            let table_name_bytes = &record_bytes[2..2 + table_name_len];
-            let table_name = match std::str::from_utf8(table_name_bytes) {
-                Ok(t) => t.to_string(),
-                Err(_) => return Ok(()),
-            };
-
-            let cbor_bytes = &record_bytes[2 + table_name_len..];
-            let value: serde_json::Value =
-                match ciborium::de::from_reader(std::io::Cursor::new(cbor_bytes)) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(table = %table_name, "Skipping malformed CBOR record: {}", e);
-                        return Ok(());
-                    }
+    let mut parser_handles = Vec::new();
+    for _ in 0..4 {
+        let chunk_rx_clone = Arc::clone(&chunk_rx);
+        let parsed_tx_clone = parsed_tx.clone();
+        let schemas_clone = schemas.clone();
+        parser_handles.push(tokio::task::spawn_blocking(move || {
+            loop {
+                let (table_name, chunk) = match chunk_rx_clone.lock().unwrap().recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break, // Channel closed
+                };
+                
+                let schema_def = match schemas_clone.get(&table_name) {
+                    Some(s) => s.clone(),
+                    None => continue,
                 };
 
-            let buf = buffers.entry(table_name.clone()).or_default();
-            if let Err(e) = serde_json::to_writer(&mut *buf, &value) {
-                warn!(table = %table_name, "Failed to serialize JSON: {}", e);
-                return Ok(());
+                let arrow_schema = build_arrow_schema(&schema_def.fields);
+                let mut buf = Vec::new();
+                for cbor_bytes in chunk {
+                    if let Ok(value) = ciborium::de::from_reader::<serde_json::Value, _>(std::io::Cursor::new(cbor_bytes)) {
+                        if serde_json::to_writer(&mut buf, &value).is_ok() {
+                            buf.push(b'\n');
+                        }
+                    }
+                }
+                if buf.is_empty() { continue; }
+                
+                if let Ok(reader) = arrow_json::ReaderBuilder::new(arrow_schema).build(std::io::Cursor::new(buf)) {
+                    let mut batches = Vec::new();
+                    for b in reader {
+                        if let Ok(batch) = b {
+                            batches.push(batch);
+                        }
+                    }
+                    if !batches.is_empty() {
+                        let _ = parsed_tx_clone.send((table_name, batches));
+                    }
+                }
             }
-            buf.push(b'\n');
-            
-            let row_tracker = row_trackers.entry(table_name.clone()).or_insert(0);
-            *row_tracker += 1;
+        }));
+    }
 
-            let bytes_tracker = buffer_bytes.entry(table_name.clone()).or_insert(0);
-            *bytes_tracker += cbor_bytes.len();
-            
-            if *row_tracker >= batch_size || *bytes_tracker >= batch_bytes_limit {
-                flush_buffer(&table_name, buf, &mut writers, &mut row_counts)?;
-                *row_tracker = 0;
-                *bytes_tracker = 0;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // value: (current_byte_count, current_records)
+            let mut raw_batches: HashMap<String, (usize, Vec<Vec<u8>>)> = HashMap::new();
+            let _ = store.iterate_cf(cf_name, |record_bytes| {
+                if record_bytes.len() < 2 { return Ok(()); }
+                let table_name_len = u16::from_be_bytes([record_bytes[0], record_bytes[1]]) as usize;
+                if record_bytes.len() < 2 + table_name_len { return Ok(()); }
+                
+                let table_name_bytes = &record_bytes[2..2 + table_name_len];
+                let table_name = match std::str::from_utf8(table_name_bytes) {
+                    Ok(t) => t.to_string(),
+                    Err(_) => return Ok(()),
+                };
+                
+                let cbor_bytes = &record_bytes[2 + table_name_len..];
+                let cbor_len = cbor_bytes.len();
+                let (current_bytes, cbor_vec) = raw_batches.entry(table_name.clone()).or_insert((0, Vec::new()));
+                cbor_vec.push(cbor_bytes.to_vec());
+                *current_bytes += cbor_len;
+
+                if cbor_vec.len() >= batch_size || *current_bytes >= batch_bytes {
+                    let chunk = std::mem::replace(cbor_vec, Vec::with_capacity(batch_size));
+                    *current_bytes = 0;
+                    let _ = chunk_tx.send((table_name.clone(), chunk));
+                }
+                Ok(())
+            });
+
+            // Drain remaining batches
+            for (table_name, (_, chunk)) in raw_batches {
+                if !chunk.is_empty() {
+                    let _ = chunk_tx.send((table_name, chunk));
+                }
             }
-            Ok(())
-        })
-        .with_context(|| format!("iterate_cf '{}' failed", cf_name))?;
+            drop(chunk_tx); // Signal parsers to stop
+            drop(parsed_tx); // Will eventually close when parsers are done
+        });
 
-    // Drain remaining partial buffers.
-    let table_names: Vec<String> = buffers.keys().cloned().collect();
-    for table_name in table_names {
-        if let Some(mut buf) = buffers.remove(&table_name) {
-            if !buf.is_empty() {
-                flush_buffer(&table_name, &mut buf, &mut writers, &mut row_counts)?;
+        // Stage 3: Compressor
+        struct TableWriter {
+            writer: parquet::arrow::ArrowWriter<Vec<u8>>,
+            row_count: u64,
+            schema: Arc<ArrowSchema>,
+            props: Arc<parquet::file::properties::WriterProperties>,
+        }
+        
+        let mut table_writers: HashMap<String, TableWriter> = HashMap::new();
+        let props = Arc::new(parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build());
+
+        while let Ok((table_name, batches)) = parsed_rx.recv() {
+            for batch in batches {
+                let num_rows = batch.num_rows() as u64;
+                
+                let tw = table_writers.entry(table_name.clone()).or_insert_with(|| {
+                    let schema_def = schemas.get(&table_name).unwrap();
+                    let arrow_schema = build_arrow_schema(&schema_def.fields);
+                    TableWriter {
+                        writer: parquet::arrow::ArrowWriter::try_new(vec![], arrow_schema.clone(), Some(props.as_ref().clone())).unwrap(),
+                        row_count: 0,
+                        schema: arrow_schema,
+                        props: props.clone(),
+                    }
+                });
+                
+                let _ = tw.writer.write(&batch);
+                tw.row_count += num_rows;
+                
+                // Pipeline condition: push a ~5MB Parquet chunk to the uploader
+                if tw.row_count >= 25_000 {
+                    let mut old_tw = table_writers.remove(&table_name).unwrap();
+                    if let Ok(parquet_bytes) = old_tw.writer.into_inner() {
+                        let _ = upload_tx.blocking_send((table_name.clone(), parquet_bytes, old_tw.row_count));
+                    }
+                }
             }
         }
-    }
+        
+        // Finalize any remaining writers
+        for (table_name, tw) in table_writers {
+            if tw.row_count > 0 {
+                if let Ok(parquet_bytes) = tw.writer.into_inner() {
+                    let _ = upload_tx.blocking_send((table_name, parquet_bytes, tw.row_count));
+                }
+            }
+        }
+    }); // end of std::thread::scope
 
-    let mut out = HashMap::new();
-    for (table_name, writer) in writers {
-        let bytes = writer
-            .into_inner()
-            .with_context(|| format!("ArrowWriter::into_inner failed for '{}'", table_name))?;
-        let rows = row_counts.remove(&table_name).unwrap_or(0);
-        out.insert(table_name, (bytes, rows));
-    }
-    Ok(out)
+    Ok(())
 }
 
 fn jittered_interval(config: &Config) -> u64 {
