@@ -55,7 +55,7 @@ pub struct Config {
     /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
     pub flush_compile_batch_bytes: usize,
 
-    /// Reject ingest with backpressure error once this many frozen CFs are pending flush. Default 3.
+    /// Number of frozen CFs to retain before enforcing backpressure. Default 3. 0 disables the limit.
     pub max_retained_frozen_cfs: usize,
 }
 
@@ -130,7 +130,7 @@ impl Config {
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()
-                .context("MAX_RETAINED_FROZEN_CFS must be a positive integer")?,
+                .context("MAX_RETAINED_FROZEN_CFS must be an integer")?,
         })
     }
 }

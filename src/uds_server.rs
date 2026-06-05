@@ -280,6 +280,23 @@ async fn handle_ingest_record(
             unflushed_bytes, max_unflushed_bytes
         ));
     }
+
+    if config.max_retained_frozen_cfs > 0 {
+        let retained = store.retained_cf_count();
+        if retained >= config.max_retained_frozen_cfs {
+            if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
+                warn!(
+                    retained,
+                    limit = config.max_retained_frozen_cfs,
+                    "Engine entering backpressure — rejecting ingest due to too many pending frozen CFs"
+                );
+            }
+            return AckResponse::error(format!(
+                "engine in backpressure: retained frozen CFs ({}) meets or exceeds limit ({})",
+                retained, config.max_retained_frozen_cfs
+            ));
+        }
+    }
     
     if IN_BACKPRESSURE.swap(false, Ordering::Relaxed) {
         info!(bytes = unflushed_bytes, "Engine exiting backpressure — accepting ingest");
