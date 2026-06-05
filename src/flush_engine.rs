@@ -96,14 +96,13 @@ pub async fn do_flush(
         let store_clone = Arc::clone(&store);
         let cf_clone = cf.clone();
         let batch_size = config.flush_compile_batch_size;
-        let batch_bytes = config.flush_compile_batch_bytes;
         let schemas_clone = schemas.clone();
 
         let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>, u64)>(16);
 
         // Spawn Stage 1, 2, 3 in a blocking thread (Reader, Parsers, Compressor)
         let compile_handle = tokio::task::spawn_blocking(move || {
-            compile_cf_pipeline(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes, upload_tx)
+            compile_cf_pipeline(&store_clone, &cf_clone, &schemas_clone, batch_size, upload_tx)
         });
 
         // Stage 4: Uploader (Async I/O)
@@ -189,12 +188,11 @@ fn compile_cf_pipeline(
     cf_name: &str,
     schemas: &HashMap<String, crate::protocol::RegisterSchema>,
     batch_size: usize,
-    batch_bytes: usize,
     upload_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>, u64)>,
 ) -> Result<()> {
     // Stage 1 & 2: Reader & Parsers
-    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(16);
-    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>)>(16);
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(2);
+    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>)>(2);
     let chunk_rx = Arc::new(std::sync::Mutex::new(chunk_rx));
 
     let mut parser_handles = Vec::new();
@@ -242,8 +240,7 @@ fn compile_cf_pipeline(
 
     std::thread::scope(|s| {
         s.spawn(|| {
-            // value: (current_byte_count, current_records)
-            let mut raw_batches: HashMap<String, (usize, Vec<Vec<u8>>)> = HashMap::new();
+            let mut raw_batches: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
             let _ = store.iterate_cf(cf_name, |record_bytes| {
                 if record_bytes.len() < 2 { return Ok(()); }
                 let table_name_len = u16::from_be_bytes([record_bytes[0], record_bytes[1]]) as usize;
@@ -256,21 +253,18 @@ fn compile_cf_pipeline(
                 };
                 
                 let cbor_bytes = &record_bytes[2 + table_name_len..];
-                let cbor_len = cbor_bytes.len();
-                let (current_bytes, cbor_vec) = raw_batches.entry(table_name.clone()).or_insert((0, Vec::new()));
+                let cbor_vec = raw_batches.entry(table_name.clone()).or_insert_with(Vec::new);
                 cbor_vec.push(cbor_bytes.to_vec());
-                *current_bytes += cbor_len;
 
-                if cbor_vec.len() >= batch_size || *current_bytes >= batch_bytes {
+                if cbor_vec.len() >= batch_size {
                     let chunk = std::mem::replace(cbor_vec, Vec::with_capacity(batch_size));
-                    *current_bytes = 0;
                     let _ = chunk_tx.send((table_name.clone(), chunk));
                 }
                 Ok(())
             });
 
             // Drain remaining batches
-            for (table_name, (_, chunk)) in raw_batches {
+            for (table_name, chunk) in raw_batches {
                 if !chunk.is_empty() {
                     let _ = chunk_tx.send((table_name, chunk));
                 }

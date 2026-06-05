@@ -51,10 +51,6 @@ pub struct Config {
     /// fewer arrow_json invocations. Default 1000.
     pub flush_compile_batch_size: usize,
 
-    /// Maximum byte size of uncompressed CBOR records to buffer per table before
-    /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
-    pub flush_compile_batch_bytes: usize,
-
     /// Number of frozen CFs to retain before enforcing backpressure. Default 3. 0 disables the limit.
     pub max_retained_frozen_cfs: usize,
 }
@@ -123,10 +119,6 @@ impl Config {
                     }
                     Ok(n)
                 })?,
-            flush_compile_batch_bytes: env::var("FLUSH_COMPILE_BATCH_BYTES")
-                .unwrap_or_else(|_| "4194304".to_string())
-                .parse()
-                .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()
