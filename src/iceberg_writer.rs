@@ -34,15 +34,15 @@ pub enum CatalogHandle {
 }
 
 /// Build the configured catalog. Call once per flush cycle, not once per table.
-pub async fn build_catalog(config: &Config) -> Result<CatalogHandle> {
-    match config.catalog_type {
-        CatalogType::Glue => build_glue_catalog(config).await.map(CatalogHandle::Glue),
-        CatalogType::Nessie => build_nessie_catalog(config).await.map(CatalogHandle::Nessie),
-    }
+pub async fn build_catalog(config: &Config) -> Result<Arc<CatalogHandle>> {
+    let handle = match config.catalog_type {
+        CatalogType::Glue => build_glue_catalog(config).await.map(CatalogHandle::Glue)?,
+        CatalogType::Nessie => build_nessie_catalog(config).await.map(CatalogHandle::Nessie)?,
+    };
+    Ok(Arc::new(handle))
 }
 
-/// Flush one table's Parquet bytes to S3 and commit to the configured catalog.
-pub async fn flush_table(
+pub async fn upload_parquet_chunk(
     catalog: &CatalogHandle,
     state: &IcebergState,
     table_name: &str,
@@ -50,34 +50,51 @@ pub async fn flush_table(
     parquet_bytes: Vec<u8>,
     record_count: u64,
     field_defs: &[FieldDef],
-) -> Result<()> {
+) -> Result<iceberg::spec::DataFile> {
     if parquet_bytes.is_empty() {
-        return Ok(());
+        anyhow::bail!("Cannot upload empty chunk");
     }
     match catalog {
         CatalogHandle::Glue(c) => {
-            do_flush_table(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
+            do_upload_parquet_chunk(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
         }
         CatalogHandle::Nessie(c) => {
-            do_flush_table(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
+            do_upload_parquet_chunk(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
         }
     }
 }
 
-async fn do_flush_table<C: Catalog>(
+pub async fn commit_data_files(
+    catalog: &CatalogHandle,
+    state: &IcebergState,
+    table_name: &str,
+    namespace: &[String],
+    data_files: Vec<iceberg::spec::DataFile>,
+    field_defs: &[FieldDef],
+) -> Result<()> {
+    if data_files.is_empty() {
+        return Ok(());
+    }
+    match catalog {
+        CatalogHandle::Glue(c) => {
+            do_commit_data_files(c, state, table_name, namespace, data_files, field_defs).await
+        }
+        CatalogHandle::Nessie(c) => {
+            do_commit_data_files(c, state, table_name, namespace, data_files, field_defs).await
+        }
+    }
+}
+
+async fn get_or_create_table<C: Catalog>(
     catalog: &C,
     state: &IcebergState,
     table_name: &str,
     namespace: &[String],
-    parquet_bytes: Vec<u8>,
-    record_count: u64,
     field_defs: &[FieldDef],
-) -> Result<()> {
+) -> Result<iceberg::table::Table> {
     let ns_ident = NamespaceIdent::from_vec(namespace.to_vec())?;
     let table_ident = TableIdent::new(ns_ident.clone(), table_name.to_string());
 
-    // Ensure namespace exists. Skip the catalog call after the first confirmation —
-    // namespaces are never deleted by this service so the cached result stays valid.
     let ns_key = namespace.join("/");
     if !state.known_namespaces.read().unwrap().contains(&ns_key) {
         if !catalog.namespace_exists(&ns_ident).await? {
@@ -87,10 +104,6 @@ async fn do_flush_table<C: Catalog>(
         state.known_namespaces.write().unwrap().insert(ns_key);
     }
 
-    // Load or create the Iceberg table.
-    // On the first encounter for this process lifetime use the standard probe.
-    // Once cached, skip the existence check and go straight to load_table —
-    // the load is still required to obtain fresh snapshot metadata for the commit.
     let table_key = format!("{}/{}", namespace.join("/"), table_name);
     let table_known = state.known_tables.read().unwrap().contains(&table_key);
 
@@ -112,6 +125,20 @@ async fn do_flush_table<C: Catalog>(
         state.known_tables.write().unwrap().insert(table_key);
         t
     };
+    Ok(table)
+}
+
+async fn do_upload_parquet_chunk<C: Catalog>(
+    catalog: &C,
+    state: &IcebergState,
+    table_name: &str,
+    namespace: &[String],
+    parquet_bytes: Vec<u8>,
+    record_count: u64,
+    field_defs: &[FieldDef],
+) -> Result<iceberg::spec::DataFile> {
+    let table = get_or_create_table(catalog, state, table_name, namespace, field_defs).await?;
+    // get_or_create_table called above
 
     // Derive the S3 path for this data file.
     let file_path = format!(
@@ -140,9 +167,19 @@ async fn do_flush_table<C: Catalog>(
         .file_size_in_bytes(bytes_len as u64)
         .build()?;
 
-    // Commit with exponential backoff on optimistic locking conflicts.
-    commit_with_retry(catalog, &table, data_file).await?;
+    Ok(data_file)
+}
 
+async fn do_commit_data_files<C: Catalog>(
+    catalog: &C,
+    state: &IcebergState,
+    table_name: &str,
+    namespace: &[String],
+    data_files: Vec<iceberg::spec::DataFile>,
+    field_defs: &[FieldDef],
+) -> Result<()> {
+    let table = get_or_create_table(catalog, state, table_name, namespace, field_defs).await?;
+    commit_with_retry(catalog, &table, data_files).await?;
     info!(table = %table_name, "Iceberg commit successful");
     Ok(())
 }
@@ -150,7 +187,7 @@ async fn do_flush_table<C: Catalog>(
 async fn commit_with_retry<C: Catalog>(
     catalog: &C,
     table: &iceberg::table::Table,
-    data_file: iceberg::spec::DataFile,
+    data_files: Vec<iceberg::spec::DataFile>,
 ) -> Result<()> {
     let max_attempts = 5u32;
     let mut delay = Duration::from_millis(200);
@@ -166,7 +203,7 @@ async fn commit_with_retry<C: Catalog>(
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
         let result = async {
             let tx = Transaction::new(&fresh_table);
-            let action = tx.fast_append().add_data_files(vec![data_file.clone()]);
+            let action = tx.fast_append().add_data_files(data_files.clone());
             let tx = action.apply(tx)?;
             tx.commit(catalog).await
         }
