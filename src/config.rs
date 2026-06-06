@@ -57,6 +57,13 @@ pub struct Config {
 
     /// Number of frozen CFs to retain before enforcing backpressure. Default 3. 0 disables the limit.
     pub max_retained_frozen_cfs: usize,
+
+    /// Number of parallel parser threads to spawn for compiling JSON to Arrow.
+    /// Defaults to the number of available CPUs (respecting container limits).
+    pub parser_threads: usize,
+
+    pub write_buffer_size: usize,
+    pub concurrent_cf_flushes: usize,
 }
 
 impl Config {
@@ -77,7 +84,7 @@ impl Config {
             }
         }
 
-        Ok(Self {
+        let mut config = Config {
             catalog_type,
             socket_path: env::var("SOCKET_PATH")
                 .unwrap_or_else(|_| "/var/run/app/iceberg.sock".to_string()),
@@ -128,9 +135,37 @@ impl Config {
                 .parse()
                 .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
-                .unwrap_or_else(|_| "3".to_string())
+                .unwrap_or_else(|_| "8".to_string())
                 .parse()
                 .context("MAX_RETAINED_FROZEN_CFS must be an integer")?,
-        })
+            parser_threads: env::var("PARSER_THREADS")
+                .map(|s| s.parse().context("PARSER_THREADS must be a positive integer"))
+                .unwrap_or_else(|_| Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)))?,
+            write_buffer_size: 4 * 1024 * 1024,
+            concurrent_cf_flushes: 1,
+        };
+
+        // 1. Read the exact memory limit injected by the sidecar webhook. Default to 512 MiB.
+        let mem_limit_bytes = env::var("ENGINE_MEM_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(512 * 1024 * 1024);
+
+        // 2. Scale flush_compile_batch_bytes dynamically.
+        // We budget ~1% of total memory for raw strings, which expands to ~10% under arrow_json overhead.
+        let raw_string_budget = mem_limit_bytes / 100;
+        config.flush_compile_batch_bytes = (raw_string_budget / config.parser_threads as u64) as usize;
+        config.flush_compile_batch_bytes = config.flush_compile_batch_bytes.max(256 * 1024); // 256KB floor
+
+        // 3. Scale concurrent CF flushes. 
+        // We budget 1 CF pipeline per 256MB of RAM.
+        config.concurrent_cf_flushes = (mem_limit_bytes / (256 * 1024 * 1024)).max(1) as usize;
+
+        // 4. Scale RocksDB write buffer size dynamically.
+        // Base is 4MB. Scale up by parser threads (more throughput = bigger buffers needed)
+        // Cap at 64MB to prevent excessive memory usage.
+        config.write_buffer_size = (4 * 1024 * 1024 * config.parser_threads).min(64 * 1024 * 1024);
+
+        Ok(config)
     }
 }

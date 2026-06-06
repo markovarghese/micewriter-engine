@@ -43,7 +43,14 @@ pub struct RocksStore {
 
 impl RocksStore {
     /// Open (or create) the RocksDB instance at `path`.
-    pub fn open(path: &str, sync_writes: bool, flush_size_bytes: u64, flush_size_jitter_bytes: u64) -> Result<Self> {
+    pub fn new(
+        path: impl AsRef<std::path::Path>,
+        flush_size_bytes: u64,
+        flush_size_jitter_bytes: u64,
+        sync_writes: bool,
+        write_buffer_size: usize,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -58,7 +65,7 @@ impl RocksStore {
         };
 
         let mut cf_opts = Options::default();
-        cf_opts.set_write_buffer_size(4 * 1024 * 1024);
+        cf_opts.set_write_buffer_size(write_buffer_size);
         cf_opts.set_max_write_buffer_number(2);
 
         let cf_descriptors: Vec<_> = cfs
@@ -180,7 +187,7 @@ impl RocksStore {
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_secs();
+                .as_micros();
             let new_cf = format!("active_{}", ts);
 
             let mut cf_opts = Options::default();

@@ -37,6 +37,7 @@ pub async fn run_flush_loop(
     state: Arc<IcebergState>,
     flush_trigger: Arc<tokio::sync::Notify>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    commit_tx: tokio::sync::mpsc::UnboundedSender<CommitRequest>,
 ) {
     loop {
         let sleep_secs = jittered_interval(&config);
@@ -58,21 +59,96 @@ pub async fn run_flush_loop(
             }
         }
 
-        // If shutdown fires during a flush, still let the flush finish — partial
-        // Iceberg state is worse than a few extra seconds of shutdown latency.
-        if let Err(e) = do_flush(Arc::clone(&store), &registry, &config, &state).await {
+        if let Err(e) = do_flush(Arc::clone(&store), &registry, &config, Arc::clone(&state), &commit_tx).await {
             error!("Flush cycle failed: {:#}", e);
         }
     }
 }
 
-/// Perform one full flush cycle: rotate → compile → upload → commit → purge.
+pub struct CommitRequest {
+    pub cf_name: String,
+    pub table_data_files: HashMap<String, Vec<iceberg::spec::DataFile>>,
+}
+
+/// Batched Iceberg Commit loop.
+pub async fn run_committer_loop(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<CommitRequest>,
+    catalog: Arc<crate::iceberg_writer::CatalogHandle>,
+    state: Arc<IcebergState>,
+    registry: SchemaRegistry,
+    store: Arc<RocksStore>,
+) {
+    loop {
+        // Wait for at least one request
+        let first_req = match rx.recv().await {
+            Some(req) => req,
+            None => break, // Channel closed (shutdown)
+        };
+
+        let mut batch = vec![first_req];
+        while let Ok(req) = rx.try_recv() {
+            batch.push(req);
+        }
+
+        let mut all_data_files: HashMap<String, Vec<iceberg::spec::DataFile>> = HashMap::new();
+        let mut cfs_to_drop = Vec::new();
+
+        for req in batch {
+            for (table, dfs) in req.table_data_files {
+                all_data_files.entry(table).or_default().extend(dfs);
+            }
+            cfs_to_drop.push(req.cf_name);
+        }
+
+        let schemas = registry.read().unwrap().clone();
+        let mut fully_committed = true;
+
+        for (table_name, data_files) in all_data_files {
+            if data_files.is_empty() { continue; }
+            let schema = schemas.get(&table_name).unwrap();
+
+            if let Err(e) = iceberg_writer::commit_data_files(
+                &catalog,
+                &state,
+                &table_name,
+                &schema.namespace,
+                data_files,
+                &schema.fields,
+            ).await {
+                error!(table = %table_name, "Batched table commit failed: {:#}", e);
+                fully_committed = false;
+            }
+        }
+
+        if fully_committed {
+            for cf in cfs_to_drop {
+                let store_clone = Arc::clone(&store);
+                let cf_clone = cf.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || store_clone.drop_frozen_cf(&cf_clone)).await {
+                    error!(cf = %cf, "Failed to drop CF after batched commit: {:#}", e);
+                } else {
+                    info!(cf = %cf, "Dropped CF after batched commit");
+                }
+            }
+        } else {
+            for cf in cfs_to_drop {
+                store.retain_frozen_cf(cf.clone());
+            }
+            warn!("Batched commit failed — frozen CFs retained for later recovery");
+        }
+    }
+    info!("Iceberg committer loop exited cleanly");
+}
+
+/// Perform one full flush cycle: rotate → compile → upload → send to committer.
+/// Returns a vector of JoinHandles so the caller can await the background processing tasks if needed.
 pub async fn do_flush(
     store: Arc<RocksStore>,
     registry: &SchemaRegistry,
     config: &Config,
-    state: &IcebergState,
-) -> Result<()> {
+    state: Arc<IcebergState>,
+    commit_tx: &tokio::sync::mpsc::UnboundedSender<CommitRequest>,
+) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>> {
     info!("Starting flush cycle");
 
     let mut cfs_to_flush = store.get_orphaned_cfs();
@@ -91,97 +167,115 @@ pub async fn do_flush(
     };
     let schemas = registry.read().unwrap().clone();
 
+    let mut handles = Vec::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrent_cf_flushes));
+
     for cf in cfs_to_flush {
-        info!(cf = %cf, "Flushing CF");
+        info!(cf = %cf, "Flushing CF in background task");
         let store_clone = Arc::clone(&store);
         let cf_clone = cf.clone();
         let batch_size = config.flush_compile_batch_size;
         let batch_bytes = config.flush_compile_batch_bytes;
+        let parser_threads = config.parser_threads;
         let schemas_clone = schemas.clone();
+        let catalog_clone = Arc::clone(&catalog);
+        let state_clone = Arc::clone(&state);
 
-        let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>, u64)>(16);
+        let commit_tx_clone = commit_tx.clone();
+        let sem_clone = Arc::clone(&semaphore);
 
-        // Spawn Stage 1, 2, 3 in a blocking thread (Reader, Parsers, Compressor)
-        let compile_handle = tokio::task::spawn_blocking(move || {
-            compile_cf_pipeline(&store_clone, &cf_clone, &schemas_clone, batch_size, batch_bytes, upload_tx)
+        let handle = tokio::spawn(async move {
+            let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>, u64)>(16);
+
+            let compile_store = Arc::clone(&store_clone);
+            let compile_cf = cf_clone.clone();
+            let compile_schemas = schemas_clone.clone();
+
+            let permit = sem_clone.acquire_owned().await.unwrap();
+            
+            // Spawn Stage 1, 2, 3 in a blocking thread (Reader, Parsers, Compressor)
+            let compile_handle = tokio::task::spawn_blocking(move || {
+                let _permit = permit; // Drop permit when CPU compilation finishes
+                compile_cf_pipeline(
+                    &compile_store,
+                    &compile_cf,
+                    &compile_schemas,
+                    batch_size,
+                    batch_bytes,
+                    parser_threads,
+                    upload_tx,
+                )
+            });
+            // Stage 4: Uploader (Async I/O)
+            let max_uploaders = parser_threads * 4; // Bounded concurrency based on CPU
+            let mut upload_join_set = tokio::task::JoinSet::new();
+            while let Some((table_name, parquet_bytes, row_count)) = upload_rx.recv().await {
+                while upload_join_set.len() >= max_uploaders {
+                    upload_join_set.join_next().await;
+                }
+                let schema = match schemas_clone.get(&table_name) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let upload_catalog = Arc::clone(&catalog_clone);
+                let upload_state = state_clone.clone();
+
+                upload_join_set.spawn(async move {
+                    let res = iceberg_writer::upload_parquet_chunk(
+                        &upload_catalog,
+                        &upload_state,
+                        &table_name,
+                        &schema.namespace,
+                        parquet_bytes,
+                        row_count,
+                        &schema.fields,
+                    ).await;
+                    (table_name, res)
+                });
+            }
+
+            let mut table_data_files: HashMap<String, Vec<iceberg::spec::DataFile>> = HashMap::new();
+            while let Some(res) = upload_join_set.join_next().await {
+                if let Ok((table_name, upload_res)) = res {
+                    match upload_res {
+                        Ok(data_file) => table_data_files.entry(table_name).or_default().push(data_file),
+                        Err(e) => error!(table = %table_name, "Failed to upload Parquet chunk: {:#}", e),
+                    }
+                }
+            }
+
+            // Wait for compilation to completely finish
+            let compile_res = compile_handle.await.context("compile task panicked")?;
+            let commit_all_ok = match compile_res {
+                Ok(_) => true,
+                Err(e) => {
+                    error!(cf = %cf_clone, "Failed to compile CF, retaining for later: {:#}", e);
+                    false
+                }
+            };
+
+            // If compilation was successful, send data files to the committer queue
+            if commit_all_ok {
+                let req = CommitRequest {
+                    cf_name: cf_clone.clone(),
+                    table_data_files,
+                };
+                if let Err(e) = commit_tx_clone.send(req) {
+                    error!(cf = %cf_clone, "Failed to send commit request to Iceberg committer: {}", e);
+                    store_clone.retain_frozen_cf(cf_clone);
+                }
+            } else {
+                store_clone.retain_frozen_cf(cf_clone.clone());
+                warn!(cf = %cf_clone, retained = store_clone.retained_cf_count(), "Failed to compile CF — frozen CF retained for later recovery");
+            }
+            
+            Ok(())
         });
 
-        // Stage 4: Uploader (Async I/O)
-        let mut upload_join_set = tokio::task::JoinSet::new();
-        while let Some((table_name, parquet_bytes, row_count)) = upload_rx.recv().await {
-            let schema = match schemas.get(&table_name) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-            let catalog_clone = Arc::clone(&catalog);
-            let state_clone = state.clone();
-
-            upload_join_set.spawn(async move {
-                let res = iceberg_writer::upload_parquet_chunk(
-                    &catalog_clone,
-                    &state_clone,
-                    &table_name,
-                    &schema.namespace,
-                    parquet_bytes,
-                    row_count,
-                    &schema.fields,
-                ).await;
-                (table_name, res)
-            });
-        }
-
-        let mut table_data_files: HashMap<String, Vec<iceberg::spec::DataFile>> = HashMap::new();
-        while let Some(res) = upload_join_set.join_next().await {
-            if let Ok((table_name, upload_res)) = res {
-                match upload_res {
-                    Ok(data_file) => table_data_files.entry(table_name).or_default().push(data_file),
-                    Err(e) => error!(table = %table_name, "Failed to upload Parquet chunk: {:#}", e),
-                }
-            }
-        }
-
-        // Wait for compilation to completely finish
-        let compile_res = compile_handle.await.context("compile task panicked")?;
-        let commit_all_ok = match compile_res {
-            Ok(_) => true,
-            Err(e) => {
-                error!(cf = %cf, "Failed to compile CF, retaining for later: {:#}", e);
-                false
-            }
-        };
-
-        // If compilation was successful, commit all data files
-        let mut fully_committed = commit_all_ok;
-        if commit_all_ok {
-            for (table_name, data_files) in table_data_files {
-                if data_files.is_empty() { continue; }
-                let schema = schemas.get(&table_name).unwrap();
-                
-                if let Err(e) = iceberg_writer::commit_data_files(
-                    &catalog,
-                    state,
-                    &table_name,
-                    &schema.namespace,
-                    data_files,
-                    &schema.fields,
-                ).await {
-                    error!(table = %table_name, "Table commit failed: {:#}", e);
-                    fully_committed = false;
-                }
-            }
-        }
-
-        if fully_committed {
-            let store_clone = Arc::clone(&store);
-            let cf_clone = cf.clone();
-            tokio::task::spawn_blocking(move || store_clone.drop_frozen_cf(&cf_clone)).await??;
-        } else {
-            store.retain_frozen_cf(cf.clone());
-            warn!(cf = %cf, retained = store.retained_cf_count(), "Some tables failed — frozen CF retained for later recovery");
-        }
+        handles.push(handle);
     }
 
-    Ok(())
+    Ok(handles)
 }
 
 fn compile_cf_pipeline(
@@ -190,15 +284,19 @@ fn compile_cf_pipeline(
     schemas: &HashMap<String, crate::protocol::RegisterSchema>,
     batch_size: usize,
     batch_bytes: usize,
+    parser_threads: usize,
     upload_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>, u64)>,
 ) -> Result<()> {
+    // Dynamic channel bounds based on thread count
+    let queue_size = (16 / parser_threads).max(2);
+    
     // Stage 1 & 2: Reader & Parsers
-    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(2);
-    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>)>(2);
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(queue_size);
+    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>)>(queue_size);
     let chunk_rx = Arc::new(std::sync::Mutex::new(chunk_rx));
 
     let mut parser_handles = Vec::new();
-    for _ in 0..1 {
+    for _ in 0..parser_threads {
         let chunk_rx_clone = Arc::clone(&chunk_rx);
         let parsed_tx_clone = parsed_tx.clone();
         let schemas_clone = schemas.clone();
@@ -216,12 +314,9 @@ fn compile_cf_pipeline(
 
                 let arrow_schema = build_arrow_schema(&schema_def.fields);
                 let mut buf = Vec::new();
-                for cbor_bytes in chunk {
-                    if let Ok(value) = ciborium::de::from_reader::<serde_json::Value, _>(std::io::Cursor::new(cbor_bytes)) {
-                        if serde_json::to_writer(&mut buf, &value).is_ok() {
-                            buf.push(b'\n');
-                        }
-                    }
+                for json_bytes in chunk {
+                    buf.extend_from_slice(&json_bytes);
+                    buf.push(b'\n');
                 }
                 if buf.is_empty() { continue; }
                 
