@@ -97,11 +97,11 @@ impl Config {
                 .unwrap_or_else(|_| "s3://iceberg".to_string()),
             glue_catalog_id: env::var("GLUE_CATALOG_ID").ok(),
             flush_interval_secs: env::var("FLUSH_INTERVAL_SECS")
-                .unwrap_or_else(|_| "600".to_string())
+                .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .context("FLUSH_INTERVAL_SECS must be a number")?,
             flush_jitter_secs: env::var("FLUSH_JITTER_SECS")
-                .unwrap_or_else(|_| "120".to_string())
+                .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .context("FLUSH_JITTER_SECS must be a number")?,
             flush_size_bytes: env::var("FLUSH_SIZE_BYTES")

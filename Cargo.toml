@@ -50,5 +50,10 @@ bytes = "1"
 # Profiling
 pprof = { version = "0.13", features = ["flamegraph"] }
 axum = "0.7"
+
+# Prometheus metrics
+prometheus = "0.13"
+lazy_static = "1.4"
+
 [features]
 # Native Rust Iceberg support is sufficient; no Python fallback needed.

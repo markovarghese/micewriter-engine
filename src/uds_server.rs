@@ -14,6 +14,7 @@ use crate::protocol::{
 };
 use crate::rocksdb_store::RocksStore;
 use crate::config::Config;
+use crate::metrics;
 
 pub type SchemaRegistry = Arc<RwLock<HashMap<String, RegisterSchema>>>;
 
@@ -176,17 +177,28 @@ async fn handle_connection(
         let msg_type = payload[0];
 
         let ack = match msg_type {
-            MSG_REGISTER_SCHEMA => handle_register_schema(&payload[1..], &registry),
+            MSG_REGISTER_SCHEMA => {
+                metrics::IPC_REQUESTS.with_label_values(&["register_schema"]).inc();
+                handle_register_schema(&payload[1..], &registry)
+            }
             MSG_INGEST_RECORD => {
+                metrics::IPC_REQUESTS.with_label_values(&["ingest_record"]).inc();
                 handle_ingest_record(payload, &tx, &registry, &store, &config)
                     .await
             }
-            MSG_FLUSH_NOW => handle_flush_now(&config, &flush_trigger),
+            MSG_FLUSH_NOW => {
+                metrics::IPC_REQUESTS.with_label_values(&["flush_now"]).inc();
+                handle_flush_now(&config, &flush_trigger)
+            }
             other => {
+                metrics::IPC_REQUESTS.with_label_values(&["unknown"]).inc();
                 warn!(byte = other, "Unknown message type");
                 AckResponse::error(format!("unknown message type 0x{:02X}", other))
             }
         };
+
+        // Track response status metric
+        metrics::IPC_RESPONSES.with_label_values(&[&ack.status]).inc();
 
         // --- Send ACK: 4-byte length prefix + JSON body ---
         let ack_bytes = serde_json::to_vec(&ack)?;

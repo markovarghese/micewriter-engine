@@ -2,6 +2,7 @@ mod config;
 mod field_type;
 mod flush_engine;
 mod iceberg_writer;
+mod metrics;
 mod protocol;
 mod rocksdb_store;
 mod uds_server;
@@ -44,6 +45,9 @@ async fn main() -> Result<()> {
     // Channel used to signal the UDS server and flush loop to stop.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Register Prometheus metrics
+    metrics::register_custom_metrics();
+
     // Spawn the debug HTTP server
     tokio::spawn(async move {
         let app = axum::Router::new().route(
@@ -72,6 +76,15 @@ async fn main() -> Result<()> {
                         b"Failed to build flamegraph".to_vec(),
                     )
                 }
+            }),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    metrics::gather_metrics(),
+                )
             }),
         );
 

@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::config::{CatalogType, Config};
 use crate::field_type::MappedType;
 use crate::protocol::FieldDef;
+use crate::metrics;
 
 /// Process-lifetime caches to avoid redundant Glue/Nessie metadata API calls.
 ///
@@ -156,6 +157,10 @@ async fn do_upload_parquet_chunk<C: Catalog>(
     writer.close().await?;
 
     info!(path = %file_path, bytes = bytes_len, "Parquet file uploaded to S3");
+    
+    // Track Parquet upload metrics
+    metrics::PARQUET_FILES_WRITTEN.inc();
+    metrics::PARQUET_BYTES_WRITTEN.inc_by(bytes_len as u64);
 
     // Build the DataFile descriptor.
     use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
@@ -181,6 +186,8 @@ async fn do_commit_data_files<C: Catalog>(
     let table = get_or_create_table(catalog, state, table_name, namespace, field_defs).await?;
     commit_with_retry(catalog, &table, data_files).await?;
     info!(table = %table_name, "Iceberg commit successful");
+    
+    metrics::CATALOG_COMMITS.inc();
     Ok(())
 }
 

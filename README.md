@@ -53,8 +53,8 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | `GLUE_CATALOG_ID` | no | — | AWS account ID for Glue Catalog |
 | `SOCKET_PATH` | no | `/var/run/app/iceberg.sock` | UDS socket path |
 | `ROCKSDB_PATH` | no | `/var/lib/rocksdb` | RocksDB data directory |
-| `FLUSH_INTERVAL_SECS` | no | `600` | Base flush interval |
-| `FLUSH_JITTER_SECS` | no | `120` | Max jitter (±) added to interval |
+| `FLUSH_INTERVAL_SECS` | no | `300` | Base flush interval |
+| `FLUSH_JITTER_SECS` | no | `60` | Random jitter added/subtracted to interval |
 | `MAX_RETAINED_FROZEN_CFS` | no | `8` | Reject ingest with backpressure error once this many frozen CFs are pending flush. `0` disables. |
 
 ## Building and Deploying

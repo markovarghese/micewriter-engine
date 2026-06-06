@@ -23,3 +23,6 @@ Desktop.ini
 *.tar
 *.gz
 *.zip
+
+# Untracked files
+flamegraph.svg
