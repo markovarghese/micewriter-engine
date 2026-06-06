@@ -36,7 +36,7 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | Byte 0 | Remaining bytes | Direction |
 |--------|----------------|-----------|
 | `0x01` | JSON `RegisterSchema` | SDK → Engine |
-| `0x02` | Native Arrow IPC `IngestRecord` | SDK → Engine |
+| `0x02` | Native Arrow IPC `IngestRecord` (JSON stream bytes) | SDK → Engine |
 | *(any)* | JSON `AckResponse` | Engine → SDK |
 
 ## Environment Variables
@@ -55,7 +55,7 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | `ROCKSDB_PATH` | no | `/var/lib/rocksdb` | RocksDB data directory |
 | `FLUSH_INTERVAL_SECS` | no | `600` | Base flush interval |
 | `FLUSH_JITTER_SECS` | no | `120` | Max jitter (±) added to interval |
-| `MAX_RETAINED_FROZEN_CFS` | no | `3` | Reject ingest with backpressure error once this many frozen CFs are pending flush. `0` disables. |
+| `MAX_RETAINED_FROZEN_CFS` | no | `8` | Reject ingest with backpressure error once this many frozen CFs are pending flush. `0` disables. |
 
 ## Building and Deploying
 
