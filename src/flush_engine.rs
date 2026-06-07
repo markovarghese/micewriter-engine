@@ -354,14 +354,14 @@ fn compile_cf_pipeline(
                     Err(_) => return Ok(()),
                 };
                 
-                let cbor_bytes = &record_bytes[2 + table_name_len..];
-                let cbor_len = cbor_bytes.len();
-                let (current_bytes, cbor_vec) = raw_batches.entry(table_name.clone()).or_insert((0, Vec::new()));
-                cbor_vec.push(cbor_bytes.to_vec());
-                *current_bytes += cbor_len;
+                let json_bytes = &record_bytes[2 + table_name_len..];
+                let json_len = json_bytes.len();
+                let (current_bytes, json_vec) = raw_batches.entry(table_name.clone()).or_insert((0, Vec::new()));
+                json_vec.push(json_bytes.to_vec());
+                *current_bytes += json_len;
 
-                if cbor_vec.len() >= batch_size || *current_bytes >= batch_bytes {
-                    let chunk = std::mem::replace(cbor_vec, Vec::with_capacity(batch_size));
+                if json_vec.len() >= batch_size || *current_bytes >= batch_bytes {
+                    let chunk = std::mem::replace(json_vec, Vec::with_capacity(batch_size));
                     *current_bytes = 0;
                     let _ = chunk_tx.send((table_name.clone(), chunk));
                 }

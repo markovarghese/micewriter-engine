@@ -51,7 +51,7 @@ pub struct Config {
     /// fewer arrow_json invocations. Default 1000.
     pub flush_compile_batch_size: usize,
 
-    /// Maximum byte size of uncompressed CBOR records to buffer per table before
+    /// Maximum byte size of uncompressed JSON records to buffer per table before
     /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
     pub flush_compile_batch_bytes: usize,
 

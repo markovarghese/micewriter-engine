@@ -239,7 +239,7 @@ fn handle_flush_now(config: &Config, flush_trigger: &tokio::sync::Notify) -> Ack
 
 /// Parse the header of an MSG_INGEST_RECORD body (everything after the
 /// 1-byte discriminant). Returns the table name and the byte offset where
-/// the CBOR payload begins. Extracted as a free function so it can be unit
+/// the JSON payload begins. Extracted as a free function so it can be unit
 /// tested without spinning up sockets or RocksDB.
 fn parse_ingest_header(body: &[u8]) -> Result<(&str, usize), &'static str> {
     if body.len() < 2 {
@@ -263,7 +263,7 @@ async fn handle_ingest_record(
 ) -> AckResponse {
     let body = &payload[1..];
 
-    let (table_name, _cbor_offset) = match parse_ingest_header(body) {
+    let (table_name, _json_offset) = match parse_ingest_header(body) {
         Ok(v) => v,
         Err(msg) => return AckResponse::error(msg),
     };
@@ -336,32 +336,32 @@ async fn handle_ingest_record(
 mod tests {
     use super::parse_ingest_header;
 
-    fn make_body(table_name: &[u8], cbor: &[u8]) -> Vec<u8> {
+    fn make_body(table_name: &[u8], json: &[u8]) -> Vec<u8> {
         let len = table_name.len() as u16;
-        let mut body = Vec::with_capacity(2 + table_name.len() + cbor.len());
+        let mut body = Vec::with_capacity(2 + table_name.len() + json.len());
         body.extend_from_slice(&len.to_be_bytes());
         body.extend_from_slice(table_name);
-        body.extend_from_slice(cbor);
+        body.extend_from_slice(json);
         body
     }
 
     #[test]
-    fn parses_valid_header_with_cbor() {
-        let body = make_body(b"telemetry_events", &[0xA0]); // empty CBOR map
+    fn parses_valid_header_with_json() {
+        let body = make_body(b"telemetry_events", b"{}"); // empty JSON object
         let (name, offset) = parse_ingest_header(&body).unwrap();
         assert_eq!(name, "telemetry_events");
         assert_eq!(offset, 2 + b"telemetry_events".len());
-        assert_eq!(&body[offset..], &[0xA0]);
+        assert_eq!(&body[offset..], b"{}");
     }
 
     #[test]
-    fn parses_minimal_one_byte_cbor() {
-        // CBOR null = single byte 0xF6. The old `+ 4` check would have
+    fn parses_minimal_one_byte_json() {
+        // e.g. JSON number "0" = single byte 0x30. The old `+ 4` check would have
         // rejected this; the fix must accept it.
-        let body = make_body(b"t", &[0xF6]);
+        let body = make_body(b"t", b"0");
         let (name, offset) = parse_ingest_header(&body).unwrap();
         assert_eq!(name, "t");
-        assert_eq!(&body[offset..], &[0xF6]);
+        assert_eq!(&body[offset..], b"0");
     }
 
     #[test]
@@ -388,13 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_zero_length_table_name_but_loses_no_cbor() {
+    fn accepts_zero_length_table_name_but_loses_no_json() {
         // Edge case: u16=0 means table_name is empty. Caller will reject via
         // the schema registry lookup, but the parser itself should succeed.
-        let body = make_body(b"", &[0xA0]);
+        let body = make_body(b"", b"{}");
         let (name, offset) = parse_ingest_header(&body).unwrap();
         assert_eq!(name, "");
         assert_eq!(offset, 2);
-        assert_eq!(&body[offset..], &[0xA0]);
+        assert_eq!(&body[offset..], b"{}");
     }
 }

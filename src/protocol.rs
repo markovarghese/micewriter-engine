@@ -30,7 +30,7 @@ pub struct FieldDef {
     /// "binary" / "bytes". Unknown values are logged and treated as "string".
     ///
     /// Wire-format note for SDK authors: `timestamptz` values must be encoded
-    /// in CBOR as ISO-8601 strings with a numeric UTC offset (e.g.
+    /// in JSON as ISO-8601 strings with a numeric UTC offset (e.g.
     /// `2026-05-30T07:30:02.123456Z` or `…+00:00`). Named timezones like
     /// `"UTC"` are NOT accepted by the engine's arrow-json parser unless
     /// arrow's `chrono-tz` feature is enabled.
@@ -51,7 +51,7 @@ fn bool_true() -> bool {
 /// is structured as follows:
 ///   [table_name_len: u16] (2 bytes, big-endian)
 ///   [table_name_bytes]    (UTF-8 string)
-///   [CBOR stream bytes]   (Remaining bytes, CBOR serialized payload)
+///   [JSON stream bytes]   (Remaining bytes, JSON serialized payload)
 ///
 /// This eliminates the need for a JSON `IngestRecord` struct, as the engine
 /// passes the raw bytes directly to RocksDB.
