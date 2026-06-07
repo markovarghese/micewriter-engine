@@ -61,7 +61,7 @@ impl MappedType {
         }
     }
 
-    pub fn to_arrow(self) -> DataType {
+    pub fn to_arrow(self, next_id: &mut i32) -> DataType {
         match self {
             Self::String => DataType::Utf8,
             Self::Long => DataType::Int64,
@@ -75,7 +75,14 @@ impl MappedType {
             Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
             Self::Date => DataType::Date32,
             Self::Binary => DataType::Binary,
-            Self::List(inner) => DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true))),
+            Self::List(inner) => {
+                let element_id = *next_id;
+                *next_id += 1;
+                let inner_type = inner.to_arrow(next_id);
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("PARQUET:field_id".to_string(), element_id.to_string());
+                DataType::List(Arc::new(Field::new("item", inner_type, true).with_metadata(metadata)))
+            }
         }
     }
 
@@ -92,9 +99,9 @@ impl MappedType {
             Self::Date => Type::Primitive(PrimitiveType::Date),
             Self::Binary => Type::Primitive(PrimitiveType::Binary),
             Self::List(inner) => {
-                let inner_type = inner.to_iceberg(next_id);
                 let element_id = *next_id;
                 *next_id += 1;
+                let inner_type = inner.to_iceberg(next_id);
                 Type::List(iceberg::spec::ListType {
                     element_field: std::sync::Arc::new(iceberg::spec::NestedField::optional(element_id, "element", inner_type)),
                 })
@@ -176,9 +183,10 @@ mod tests {
         ];
         for t in all {
             // Just call both — failures here mean the impl panicked.
-            let _ = t.to_arrow();
-            let mut next_id = 1;
-            let _ = t.to_iceberg(&mut next_id);
+            let mut next_id_arrow = 1;
+            let _ = t.clone().to_arrow(&mut next_id_arrow);
+            let mut next_id_iceberg = 1;
+            let _ = t.to_iceberg(&mut next_id_iceberg);
         }
     }
 
@@ -186,7 +194,8 @@ mod tests {
     fn timestamptz_uses_offset_not_named_zone() {
         // arrow-json (without chrono-tz) rejects "UTC". Guard against
         // accidentally regressing to a named timezone.
-        match MappedType::TimestampTz.to_arrow() {
+        let mut next_id = 1;
+        match MappedType::TimestampTz.to_arrow(&mut next_id) {
             DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => {
                 assert!(tz.starts_with('+') || tz.starts_with('-'),
                     "expected offset timezone, got '{}'", tz);

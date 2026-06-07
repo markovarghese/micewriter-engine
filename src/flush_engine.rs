@@ -15,11 +15,16 @@ use crate::uds_server::SchemaRegistry;
 use arrow::datatypes::{Field, Schema as ArrowSchema};
 
 fn build_arrow_schema(fields: &[FieldDef]) -> Arc<ArrowSchema> {
+    let mut next_id = 1;
     let arrow_fields = fields
         .iter()
         .map(|f| {
-            let dt = MappedType::from_str_or_string(&f.field_type, &f.name).to_arrow();
-            Field::new(&f.name, dt, !f.required)
+            let field_id = next_id;
+            next_id += 1;
+            let dt = MappedType::from_str_or_string(&f.field_type, &f.name).to_arrow(&mut next_id);
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
+            Field::new(&f.name, dt, !f.required).with_metadata(metadata)
         })
         .collect::<Vec<_>>();
     Arc::new(ArrowSchema::new(arrow_fields))

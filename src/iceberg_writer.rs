@@ -272,16 +272,17 @@ async fn build_glue_catalog(config: &Config) -> Result<GlueCatalog> {
 }
 
 fn build_iceberg_schema(fields: &[FieldDef]) -> Result<Schema> {
-    let mut next_id = fields.len() as i32 + 1;
+    let mut next_id = 1;
     let nested: Vec<_> = fields
         .iter()
-        .enumerate()
-        .map(|(i, f)| {
+        .map(|f| {
+            let field_id = next_id;
+            next_id += 1;
             let field_type = MappedType::from_str_or_string(&f.field_type, &f.name).to_iceberg(&mut next_id);
             if f.required {
-                NestedField::required(i as i32 + 1, &f.name, field_type)
+                NestedField::required(field_id, &f.name, field_type)
             } else {
-                NestedField::optional(i as i32 + 1, &f.name, field_type)
+                NestedField::optional(field_id, &f.name, field_type)
             }
         })
         .map(Arc::new)
