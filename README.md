@@ -5,16 +5,11 @@ Memory-safe Rust sidecar engine. Accepts telemetry records over a Unix Domain So
 
 ## Architecture
 
-```
-Java SDK  ──UDS──►  uds_server.rs  ──►  rocksdb_store.rs (active CF)
-                                                │
-                                      (every ~10 min)
-                                                │
-                               flush_engine.rs  ▼
-                                  rotate CF ──► parquet_writer.rs ──► iceberg_writer.rs
-                                                                          │
-                                                              MinIO S3 + Nessie commit
-```
+<img src="docs/architecture.svg" alt="mIceWriter Engine architecture — telemetry records flow from the Java SDK over a Unix domain socket into uds_server.rs, are buffered in RocksDB, then flushed as Parquet to an Apache Iceberg table" width="100%">
+
+> The diagram above is an animated SVG (SMIL) — open it on GitHub or in a browser to watch records stream from the socket all the way to the Iceberg table.
+
+**Flow:** the Java SDK sends framed messages over a Unix domain socket to `uds_server.rs`, which registers schemas in an in-memory `SchemaRegistry` and batches ingest records into the **active** RocksDB column family (`rocksdb_store.rs`). On a jittered ~5-minute cycle (or a manual `MSG_FLUSH_NOW`), `flush_engine.rs` rotates the active CF to a frozen CF and runs the `compile_cf_pipeline`: a reader strips the record header, a CPU-scaled parser pool turns the raw JSON into Arrow `RecordBatch`es (`arrow_json`), and a Parquet writer (`ArrowWriter`, Snappy) produces data files that are uploaded to MinIO S3 and committed to the Apache Iceberg table via `iceberg_writer.rs` (`fast_append` against Nessie/Glue, with retry).
 
 ## Source Layout
 
@@ -25,9 +20,8 @@ Java SDK  ──UDS──►  uds_server.rs  ──►  rocksdb_store.rs (active
 | `protocol.rs` | IPC message types (`RegisterSchema`, `IngestRecord`, `AckResponse`) |
 | `uds_server.rs` | Async Tokio UDS listener + frame parser |
 | `rocksdb_store.rs` | Active/frozen CF rotation and record append |
-| `flush_engine.rs` | Jittered cron loop, orchestrates compile → upload → commit |
-| `parquet_writer.rs` | `IngestRecord[]` → Arrow `RecordBatch` → Parquet bytes |
-| `iceberg_writer.rs` | Iceberg REST catalog ops (create table, `fast_append`, commit) |
+| `flush_engine.rs` | Jittered cron loop + `compile_cf_pipeline`: reader → parser pool (`arrow_json` → Arrow `RecordBatch`) → Parquet writer → upload → commit |
+| `iceberg_writer.rs` | Iceberg catalog ops (create table, `fast_append`, commit) |
 
 ## IPC Protocol
 
@@ -36,7 +30,7 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | Byte 0 | Remaining bytes | Direction |
 |--------|----------------|-----------|
 | `0x01` | JSON `RegisterSchema` | SDK → Engine |
-| `0x02` | Native Arrow IPC `IngestRecord` (JSON stream bytes) | SDK → Engine |
+| `0x02` | `IngestRecord`: `[u16 table_name_len][table_name][raw JSON bytes]` | SDK → Engine |
 | *(any)* | JSON `AckResponse` | Engine → SDK |
 
 ## Environment Variables
