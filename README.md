@@ -9,7 +9,7 @@ Memory-safe Rust sidecar engine. Accepts telemetry records over a Unix Domain So
 
 > The diagram above is an animated SVG (SMIL) — open it on GitHub or in a browser to watch records stream from the socket all the way to the Iceberg table.
 
-**Flow:** the Java SDK sends framed messages over a Unix domain socket to `uds_server.rs`, which registers schemas in an in-memory `SchemaRegistry` and batches ingest records into the **active** RocksDB column family (`rocksdb_store.rs`). On a jittered ~5-minute cycle (or a manual `MSG_FLUSH_NOW`), `flush_engine.rs` rotates the active CF to a frozen CF and runs the `compile_cf_pipeline`: a reader strips the record header, a CPU-scaled parser pool turns the raw JSON into Arrow `RecordBatch`es (`arrow_json`), and a Parquet writer (`ArrowWriter`, Snappy) produces data files that are uploaded to MinIO S3 and committed to the Apache Iceberg table via `iceberg_writer.rs` (`fast_append` against Nessie/Glue, with retry).
+**Flow:** the Java SDK sends framed JSON messages over a Unix domain socket to `uds_server.rs`, which registers schemas in an in-memory `SchemaRegistry` and uses a CPU-scaled parser pool to parse incoming JSON into Arrow IPC format *before* writing to RocksDB. These IPC records are batched into the **active** RocksDB column family (`rocksdb_store.rs`). On a jittered ~10-minute cycle (or a manual `MSG_FLUSH_NOW`), `flush_engine.rs` rotates the active CF to a frozen CF and runs the `flush_pipeline`: the frozen Arrow IPC records are read and streamed directly into Parquet row groups (using `AsyncArrowWriter` and multipart uploads) to MinIO S3, and then committed to the Apache Iceberg table via `iceberg_writer.rs` (`fast_append` against Nessie/Glue, with retry).
 
 ## Source Layout
 
