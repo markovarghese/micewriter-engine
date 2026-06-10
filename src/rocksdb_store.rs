@@ -67,6 +67,8 @@ impl RocksStore {
         let mut cf_opts = Options::default();
         cf_opts.set_write_buffer_size(write_buffer_size);
         cf_opts.set_max_write_buffer_number(2);
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+        cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
 
         let cf_descriptors: Vec<_> = cfs
             .iter()
@@ -193,6 +195,8 @@ impl RocksStore {
             let mut cf_opts = Options::default();
             cf_opts.set_write_buffer_size(4 * 1024 * 1024);
             cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+            cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
             self.db.write().unwrap().create_cf(&new_cf, &cf_opts)?;
             *active = new_cf;
             

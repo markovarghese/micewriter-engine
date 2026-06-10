@@ -18,6 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+# SSE4.2 + PCLMULQDQ for RocksDB hardware CRC32C (defines __SSE4_2__ in crc32c.cc)
+ENV CFLAGS="-msse4.2 -mpclmul"
+ENV CXXFLAGS="-msse4.2 -mpclmul"
+
 # Cache dependency compilation separately from source.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs

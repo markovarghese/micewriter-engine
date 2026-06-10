@@ -28,14 +28,14 @@ cargo fmt
 This is a **Kubernetes sidecar** in the [mIceWriter Ingestion Ecosystem](../micewriter-hub/README.md). It sits alongside a Java application, accepts telemetry records over a Unix Domain Socket, durably buffers them in a local RocksDB instance, and on a jittered ~10-minute cycle flushes them as Parquet files to an Apache Iceberg table.
 
 ```
-Java SDK ──UDS──► uds_server.rs ──► rocksdb_store.rs (active CF)
+Java SDK ──UDS──► uds_server.rs (JSON→Arrow IPC) ──► rocksdb_store.rs (active CF)
                                               │
                                     (every ~10 min)
                                               │
                            flush_engine.rs   ▼
-                              rotate CF ──► JSON→Arrow→Parquet ──► iceberg_writer.rs
+                              rotate CF ──► IPC→Arrow ──► rolling Parquet stream ──► MinIO S3
                                                                          │
-                                                             MinIO S3 + Nessie/Glue commit
+                                                       iceberg_writer.rs (Nessie/Glue commit)
 ```
 
 ### IPC Protocol
@@ -43,7 +43,7 @@ Java SDK ──UDS──► uds_server.rs ──► rocksdb_store.rs (active CF)
 All frames use a **4-byte big-endian length prefix** + 1-byte message type discriminant:
 
 - `0x01` (`MSG_REGISTER_SCHEMA`): JSON `RegisterSchema` body — sent once per table on SDK startup. Stored in an in-memory `SchemaRegistry` (`Arc<RwLock<HashMap<String, RegisterSchema>>>`). **Lost on restart; SDK must re-register.**
-- `0x02` (`MSG_INGEST_RECORD`): Custom binary frame — `[u16 table_name_len][table_name_bytes][JSON stream bytes]`. The JSON bytes are stored raw in RocksDB with no deserialization on the hot path.
+- `0x02` (`MSG_INGEST_RECORD`): Custom binary frame — `[u16 table_name_len][table_name_bytes][JSON stream bytes]`. The batching writer thread converts the JSON body to a self-describing Arrow IPC stream (`arrow_convert::json_to_ipc`) before persisting, so RocksDB stores `[u16 table_name_len][table_name_bytes][Arrow IPC bytes]`. Records for tables without a registered schema are NACKed.
 - `0x03` (`MSG_FLUSH_NOW`): No body — triggers an immediate flush cycle. Only accepted when `ENABLE_MANUAL_FLUSH=true`; used for testing.
 - ACK responses (Engine → SDK): 4-byte length prefix + JSON `AckResponse`.
 
@@ -53,7 +53,7 @@ All frames use a **4-byte big-endian length prefix** + 1-byte message type discr
 
 1. On flush, `rotate()` creates a new `active_<timestamp>` CF and atomically switches it to be the active target, leaving the old CF frozen in place.
 2. The frozen CF is drained and passed to the flush pipeline.
-3. After a successful Iceberg commit, `drop_frozen_cf()` deletes it. If any table fails, the frozen CF is **retained** for manual inspection.
+3. After a successful Iceberg commit, `drop_frozen_cf()` deletes it. If any table's write or commit fails — including a missing schema/write context after a restart — the frozen CF is **retained** and retried on the next flush cycle.
 
 Records are keyed by a monotonically increasing 8-byte big-endian counter.
 
@@ -61,8 +61,9 @@ Records are keyed by a monotonically increasing 8-byte big-endian counter.
 
 `flush_engine.rs` → `iceberg_writer.rs`:
 
-- `flush_engine.rs` streams records from the frozen CF, strips the `[u16 table_name_len + table_name]` header, and batches the raw JSON bytes into dynamically-sized memory chunks based on available pod memory. These chunks are pushed to a pool of concurrent parser threads (scaled dynamically to available CPU cores) which parse the JSON into Arrow `RecordBatch`es using `arrow_json::ReaderBuilder`. The batches are then pushed to a background task that writes a single in-memory Parquet file per table using `ArrowWriter`.
-- `iceberg_writer::flush_table` creates the namespace/table if absent, derives the Iceberg schema from the registered `FieldDef` list, uploads the Parquet bytes via the table's `FileIO` abstraction (S3/MinIO), and commits using `fast_append` with up to 5 retries and exponential backoff (for optimistic locking conflicts).
+- `flush_engine.rs` streams records from the frozen CF, strips the `[u16 table_name_len + table_name]` header, and batches the Arrow IPC payloads into dynamically-sized memory chunks based on available pod memory. A pool of parser threads (scaled to available CPU cores) decodes the IPC into `RecordBatch`es and concatenates each chunk into a single batch.
+- The batches stream through iceberg-rust's native writer stack (`DataFileWriter` → `RollingFileWriter` → `ParquetWriter`) directly to the table's `FileIO` (opendal S3 multipart). The rolling writer starts a new Parquet file when written + buffered bytes exceed `TARGET_PARQUET_BYTES`, and `close()` returns `DataFile`s with full column stats. Writer memory is bounded per table by `PARQUET_ROW_GROUP_BYTES` (~16 MiB default): a per-table `max_row_group_size` row cap is derived from the observed average record size, and each completed row group flushes to S3 and frees. Total flush concurrency is bounded by a process-wide semaphore (`concurrent_cf_flushes`).
+- A dedicated committer task batches `DataFile`s across CF flushes and commits per table using `fast_append` with up to 5 retries and exponential backoff (for optimistic locking conflicts), creating the namespace/table if absent from the registered `FieldDef` list.
 
 ### Catalog Support
 

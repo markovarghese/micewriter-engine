@@ -3,17 +3,16 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iceberg::spec::{NestedField, Schema, Type};
+use iceberg::spec::{NestedField, Schema, SchemaRef};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogBuilder};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::config::{CatalogType, Config};
 use crate::field_type::MappedType;
-use crate::protocol::FieldDef;
 use crate::metrics;
+use crate::protocol::FieldDef;
 
 /// Process-lifetime caches to avoid redundant Glue/Nessie metadata API calls.
 ///
@@ -43,24 +42,32 @@ pub async fn build_catalog(config: &Config) -> Result<Arc<CatalogHandle>> {
     Ok(Arc::new(handle))
 }
 
-pub async fn upload_parquet_chunk(
+/// Pre-resolve a table's FileIO, warehouse location, and Iceberg schema for streaming writes.
+/// Creates the table/namespace if not yet present. Called once per flush cycle
+/// before entering the blocking compile phase.
+pub async fn get_table_write_context(
     catalog: &CatalogHandle,
     state: &IcebergState,
     table_name: &str,
     namespace: &[String],
-    parquet_bytes: Vec<u8>,
-    record_count: u64,
     field_defs: &[FieldDef],
-) -> Result<iceberg::spec::DataFile> {
-    if parquet_bytes.is_empty() {
-        anyhow::bail!("Cannot upload empty chunk");
-    }
+) -> Result<(iceberg::io::FileIO, String, SchemaRef)> {
     match catalog {
         CatalogHandle::Glue(c) => {
-            do_upload_parquet_chunk(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
+            let table = get_or_create_table(c, state, table_name, namespace, field_defs).await?;
+            Ok((
+                table.file_io().clone(),
+                table.metadata().location().to_string(),
+                table.metadata().current_schema().clone(),
+            ))
         }
         CatalogHandle::Nessie(c) => {
-            do_upload_parquet_chunk(c, state, table_name, namespace, parquet_bytes, record_count, field_defs).await
+            let table = get_or_create_table(c, state, table_name, namespace, field_defs).await?;
+            Ok((
+                table.file_io().clone(),
+                table.metadata().location().to_string(),
+                table.metadata().current_schema().clone(),
+            ))
         }
     }
 }
@@ -129,52 +136,6 @@ async fn get_or_create_table<C: Catalog>(
     Ok(table)
 }
 
-async fn do_upload_parquet_chunk<C: Catalog>(
-    catalog: &C,
-    state: &IcebergState,
-    table_name: &str,
-    namespace: &[String],
-    parquet_bytes: Vec<u8>,
-    record_count: u64,
-    field_defs: &[FieldDef],
-) -> Result<iceberg::spec::DataFile> {
-    let table = get_or_create_table(catalog, state, table_name, namespace, field_defs).await?;
-    // get_or_create_table called above
-
-    // Derive the S3 path for this data file.
-    let file_path = format!(
-        "{}/data/{}.parquet",
-        table.metadata().location(),
-        Uuid::new_v4()
-    );
-
-    // Write Parquet bytes to S3 via the table's FileIO abstraction.
-    let file_io = table.file_io();
-    let output = file_io.new_output(&file_path)?;
-    let mut writer = output.writer().await?;
-    let bytes_len = parquet_bytes.len();
-    writer.write(parquet_bytes.into()).await?;
-    writer.close().await?;
-
-    info!(path = %file_path, bytes = bytes_len, "Parquet file uploaded to S3");
-    
-    // Track Parquet upload metrics
-    metrics::PARQUET_FILES_WRITTEN.inc();
-    metrics::PARQUET_BYTES_WRITTEN.inc_by(bytes_len as u64);
-
-    // Build the DataFile descriptor.
-    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
-    let data_file = DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(file_path)
-        .file_format(DataFileFormat::Parquet)
-        .record_count(record_count)
-        .file_size_in_bytes(bytes_len as u64)
-        .build()?;
-
-    Ok(data_file)
-}
-
 async fn do_commit_data_files<C: Catalog>(
     catalog: &C,
     state: &IcebergState,
@@ -186,7 +147,7 @@ async fn do_commit_data_files<C: Catalog>(
     let table = get_or_create_table(catalog, state, table_name, namespace, field_defs).await?;
     commit_with_retry(catalog, &table, data_files).await?;
     info!(table = %table_name, "Iceberg commit successful");
-    
+
     metrics::CATALOG_COMMITS.inc();
     Ok(())
 }

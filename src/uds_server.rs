@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -26,6 +26,11 @@ const WRITE_BATCH_MAX: usize = 1000;
 /// second when the catalog is down; per-rejection warnings would flood logs.
 static IN_BACKPRESSURE: AtomicBool = AtomicBool::new(false);
 
+/// Bumped on every schema (re-)registration so the writer thread knows to
+/// invalidate its per-table Arrow schema cache — otherwise a re-registered
+/// schema (SDK restart with new fields) would be ignored until engine restart.
+static REGISTRY_VERSION: AtomicU64 = AtomicU64::new(0);
+
 /// One pending write: the raw payload bytes (including the 1-byte discriminant
 /// at offset 0) plus a oneshot the writer task uses to signal persistence.
 type WriteRequest = (Vec<u8>, oneshot::Sender<Result<(), String>>);
@@ -50,15 +55,29 @@ pub async fn run_server(
 
     let mut join_set = tokio::task::JoinSet::new();
 
-    let (tx, mut rx) = mpsc::channel::<WriteRequest>(4);
+    // Each queued request holds a full payload (~2.4MB JSON at 1MB-payload load),
+    // so depth bounds ingest memory: 64 allowed ~150MB of queued frames. Depth
+    // measurably doesn't affect throughput (4 vs 64 benchmarked identical —
+    // results.md 2026-06-07); keep it small to protect the 512Mi limit.
+    let (tx, mut rx) = mpsc::channel::<WriteRequest>(8);
 
     let writer_store = Arc::clone(&store);
+    let writer_registry = Arc::clone(&registry);
     let writer_flush_trigger = Arc::clone(&flush_trigger);
     let writer_handle = tokio::task::spawn_blocking(move || {
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_MAX);
         let mut acks: Vec<oneshot::Sender<Result<(), String>>> = Vec::with_capacity(WRITE_BATCH_MAX);
+        // Per-table Arrow schema cache; avoids rebuilding on every record.
+        // Invalidated whenever REGISTRY_VERSION moves (schema re-registration).
+        let mut schema_cache = HashMap::new();
+        let mut cached_registry_version = REGISTRY_VERSION.load(Ordering::Acquire);
 
         while let Some((payload, ack)) = rx.blocking_recv() {
+            let registry_version = REGISTRY_VERSION.load(Ordering::Acquire);
+            if registry_version != cached_registry_version {
+                schema_cache.clear();
+                cached_registry_version = registry_version;
+            }
             let mut batch_bytes = payload.len();
             payloads.push(payload);
             acks.push(ack);
@@ -76,8 +95,66 @@ pub async fn run_server(
                 }
             }
 
-            // Strip the 1-byte discriminant from each payload before persisting.
-            let bodies: Vec<&[u8]> = payloads.iter().map(|p| &p[1..]).collect();
+            // Convert each record's JSON body to Arrow IPC before persisting.
+            // Records that fail conversion are acked with an error immediately and
+            // excluded from the batch so one bad record doesn't fail the rest.
+            let mut converted_bodies: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+            let mut pending_acks: Vec<oneshot::Sender<Result<(), String>>> =
+                Vec::with_capacity(payloads.len());
+
+            for (payload, ack) in payloads.drain(..).zip(acks.drain(..)) {
+                let body = &payload[1..];
+                let (table_name, json_offset) = match parse_ingest_header(body) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        let _ = ack.send(Err(msg.to_string()));
+                        continue;
+                    }
+                };
+
+                let arrow_schema = match schema_cache.get(table_name) {
+                    Some(s) => Arc::clone(s),
+                    None => {
+                        let reg = writer_registry.read().unwrap();
+                        let schema_def = match reg.get(table_name) {
+                            Some(s) => s.clone(),
+                            None => {
+                                drop(reg);
+                                let _ = ack.send(Err(format!(
+                                    "unknown table '{}' — schema not registered",
+                                    table_name
+                                )));
+                                continue;
+                            }
+                        };
+                        drop(reg);
+                        let s = crate::arrow_convert::build_arrow_schema(&schema_def.fields);
+                        schema_cache.insert(table_name.to_string(), Arc::clone(&s));
+                        s
+                    }
+                };
+
+                let ipc = match crate::arrow_convert::json_to_ipc(&arrow_schema, &body[json_offset..]) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = ack.send(Err(format!("json→ipc conversion failed: {}", e)));
+                        continue;
+                    }
+                };
+
+                // Re-frame: keep [u16 table_name_len][table_name] header, replace JSON with IPC.
+                let mut new_body = Vec::with_capacity(json_offset + ipc.len());
+                new_body.extend_from_slice(&body[..json_offset]);
+                new_body.extend_from_slice(&ipc);
+                converted_bodies.push(new_body);
+                pending_acks.push(ack);
+            }
+
+            if converted_bodies.is_empty() {
+                continue;
+            }
+
+            let bodies: Vec<&[u8]> = converted_bodies.iter().map(|b| b.as_slice()).collect();
             let result = writer_store.append_batch(&bodies);
 
             match result {
@@ -85,19 +162,18 @@ pub async fn run_server(
                     if should_flush {
                         writer_flush_trigger.notify_one();
                     }
-                    for ack in acks.drain(..) {
+                    for ack in pending_acks.drain(..) {
                         let _ = ack.send(Ok(()));
                     }
                 }
                 Err(e) => {
                     let err_str = e.to_string();
                     tracing::error!("RocksDB batch append failed: {}", err_str);
-                    for ack in acks.drain(..) {
+                    for ack in pending_acks.drain(..) {
                         let _ = ack.send(Err(err_str.clone()));
                     }
                 }
             }
-            payloads.clear();
         }
     });
 
@@ -216,6 +292,7 @@ fn handle_register_schema(body: &[u8], registry: &SchemaRegistry) -> AckResponse
         Ok(schema) => {
             let table = schema.table.clone();
             registry.write().unwrap().insert(table.clone(), schema);
+            REGISTRY_VERSION.fetch_add(1, Ordering::Release);
             info!(table = %table, "Schema registered");
             AckResponse::ok()
         }

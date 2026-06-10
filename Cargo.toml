@@ -23,11 +23,12 @@ iceberg-storage-opendal = "0.9"
 # Columnar in-memory format and Parquet serialization
 arrow = "57"
 arrow-json = "57"
-parquet = { version = "57", features = ["arrow"] }
+parquet = { version = "57", features = ["arrow", "zstd"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
 
 
 # Randomness for flush jitter
@@ -54,6 +55,9 @@ axum = "0.7"
 # Prometheus metrics
 prometheus = "0.13"
 lazy_static = "1.4"
+
+[profile.release]
+debug = 1
 
 [features]
 # Native Rust Iceberg support is sufficient; no Python fallback needed.

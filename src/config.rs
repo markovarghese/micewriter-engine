@@ -64,6 +64,32 @@ pub struct Config {
 
     pub write_buffer_size: usize,
     pub concurrent_cf_flushes: usize,
+
+    /// Target encoded byte size per Parquet file; the rolling writer starts a
+    /// new file once written + in-progress bytes exceed this (default 64 MiB).
+    pub target_parquet_bytes: usize,
+
+    /// Target in-memory byte size per Parquet row group (default 16 MiB).
+    /// parquet only exposes a row-count knob, so the flush pipeline derives a
+    /// per-table row cap from this and the observed average record size. This
+    /// is the primary bound on writer memory: a row group buffers entirely in
+    /// RAM before it can flush to S3.
+    pub parquet_row_group_bytes: usize,
+
+    /// Parquet compression codec (default SNAPPY). Accepts NONE|SNAPPY|ZSTD.
+    pub parquet_compression: parquet::basic::Compression,
+}
+
+fn parse_parquet_compression(s: &str) -> anyhow::Result<parquet::basic::Compression> {
+    use parquet::basic::{Compression, ZstdLevel};
+    Ok(match s.trim().to_ascii_uppercase().as_str() {
+        "NONE" | "UNCOMPRESSED" => Compression::UNCOMPRESSED,
+        "SNAPPY"                => Compression::SNAPPY,
+        "ZSTD"                  => Compression::ZSTD(ZstdLevel::default()),
+        other => anyhow::bail!(
+            "unsupported PARQUET_COMPRESSION '{}' (expected NONE|SNAPPY|ZSTD)", other
+        ),
+    })
 }
 
 impl Config {
@@ -143,6 +169,17 @@ impl Config {
                 .unwrap_or_else(|_| Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)))?,
             write_buffer_size: 4 * 1024 * 1024,
             concurrent_cf_flushes: 1,
+            target_parquet_bytes: env::var("TARGET_PARQUET_BYTES")
+                .unwrap_or_else(|_| "67108864".to_string())
+                .parse()
+                .context("TARGET_PARQUET_BYTES must be a positive integer")?,
+            parquet_row_group_bytes: env::var("PARQUET_ROW_GROUP_BYTES")
+                .unwrap_or_else(|_| "16777216".to_string())
+                .parse()
+                .context("PARQUET_ROW_GROUP_BYTES must be a positive integer")?,
+            parquet_compression: parse_parquet_compression(
+                &env::var("PARQUET_COMPRESSION").unwrap_or_else(|_| "SNAPPY".to_string()),
+            )?,
         };
 
         // 1. Read the exact memory limit injected by the sidecar webhook. Default to 512 MiB.

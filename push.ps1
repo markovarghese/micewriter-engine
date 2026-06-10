@@ -16,8 +16,10 @@ $fullTag  = "${registry}/${image}:${tag}"
 
 Write-Host "Building $image..."
 docker build -t $fullTag .
+if ($LASTEXITCODE -ne 0) { throw "docker step failed ($LASTEXITCODE)" }
 
 Write-Host "Pushing $fullTag..."
 docker push $fullTag
+if ($LASTEXITCODE -ne 0) { throw "docker step failed ($LASTEXITCODE)" }
 
 Write-Host "Done. Image available at $fullTag"

@@ -1,3 +1,4 @@
+mod arrow_convert;
 mod config;
 mod field_type;
 mod flush_engine;
@@ -42,6 +43,10 @@ async fn main() -> Result<()> {
 
     let flush_trigger = Arc::new(tokio::sync::Notify::new());
 
+    // Shared across all flush cycles (including the emergency flush) so total
+    // concurrent CF pipelines stay bounded even when cycles overlap.
+    let flush_semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrent_cf_flushes));
+
     // Channel used to signal the UDS server and flush loop to stop.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -52,16 +57,19 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let app = axum::Router::new().route(
             "/debug/pprof/flamegraph",
-            axum::routing::get(|| async {
+            axum::routing::get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
                 use axum::response::IntoResponse;
+                let seconds = params.get("seconds")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(15)
+                    .clamp(1, 300);
                 let guard = pprof::ProfilerGuardBuilder::default()
                     .frequency(100)
                     .blocklist(&["libc", "libgcc", "pthread", "vdso"])
                     .build()
                     .unwrap();
 
-                // Profile for 15 seconds
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
 
                 if let Ok(report) = guard.report().build() {
                     let mut body = Vec::new();
@@ -139,6 +147,7 @@ async fn main() -> Result<()> {
     let flush_loop_trigger = Arc::clone(&flush_trigger);
     let flush_shutdown_rx = shutdown_rx.clone();
     let flush_commit_tx = commit_tx.clone();
+    let flush_loop_semaphore = Arc::clone(&flush_semaphore);
     let flush_loop_handle = tokio::spawn(async move {
         flush_engine::run_flush_loop(
             flush_store,
@@ -148,6 +157,7 @@ async fn main() -> Result<()> {
             flush_loop_trigger,
             flush_shutdown_rx,
             flush_commit_tx,
+            flush_loop_semaphore,
         ).await;
     });
 
@@ -166,7 +176,7 @@ async fn main() -> Result<()> {
     let _ = flush_loop_handle.await;
 
     // Emergency flush: drain anything in the active CF before exiting.
-    match flush_engine::do_flush(Arc::clone(&store), &registry, &config, Arc::clone(&iceberg_state), &commit_tx).await {
+    match flush_engine::do_flush(Arc::clone(&store), &registry, &config, Arc::clone(&iceberg_state), &commit_tx, Arc::clone(&flush_semaphore)).await {
         Ok(handles) => {
             info!("Emergency flush spawned, waiting for Parquet compilation & S3 uploads...");
             for handle in handles {
