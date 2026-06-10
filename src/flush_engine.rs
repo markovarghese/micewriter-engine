@@ -52,7 +52,7 @@ pub async fn run_flush_loop(
                 info!("Timer triggered flush");
             }
             _ = flush_trigger.notified() => {
-                info!("Manual flush triggered via IPC");
+                info!("IPC flush triggered (size limit or manual)");
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
