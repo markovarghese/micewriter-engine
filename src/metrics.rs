@@ -24,7 +24,7 @@ lazy_static! {
 
     pub static ref IPC_REQUESTS: IntCounterVec = IntCounterVec::new(
         Opts::new("engine_ipc_requests_total", "Total IPC requests received by engine"),
-        &["type"]
+        &["req_type"]
     )
     .expect("metric can be created");
 
