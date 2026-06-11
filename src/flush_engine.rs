@@ -334,6 +334,7 @@ fn compile_cf_pipeline(
             }
         }));
     }
+    drop(chunk_rx); // Drop the main thread's copy of the Receiver so it closes when parsers exit!
 
     let completed_data_files = std::thread::scope(|s| -> Result<HashMap<String, Vec<iceberg::spec::DataFile>>> {
         let parsed_rx = parsed_rx; // Take ownership so it drops when this closure returns
