@@ -327,13 +327,16 @@ fn compile_cf_pipeline(
                             batches
                         }
                     };
-                    let _ = parsed_tx_clone.send((table_name, batches, chunk_bytes));
+                    if parsed_tx_clone.send((table_name, batches, chunk_bytes)).is_err() {
+                        break; // Receiver dropped, abort pipeline
+                    }
                 }
             }
         }));
     }
 
     let completed_data_files = std::thread::scope(|s| -> Result<HashMap<String, Vec<iceberg::spec::DataFile>>> {
+        let parsed_rx = parsed_rx; // Take ownership so it drops when this closure returns
         // Stage 1: Reader (scoped thread).
         // chunk_tx and parsed_tx are moved in so dropping them inside closes the channels.
         s.spawn(move || {
@@ -358,7 +361,9 @@ fn compile_cf_pipeline(
                 if payload_vec.len() >= batch_size || *current_bytes >= batch_bytes {
                     let chunk = std::mem::replace(payload_vec, Vec::with_capacity(batch_size));
                     *current_bytes = 0;
-                    let _ = chunk_tx.send((table_name.clone(), chunk));
+                    if chunk_tx.send((table_name.clone(), chunk)).is_err() {
+                        return Err(anyhow::anyhow!("Pipeline aborted: consumer dropped"));
+                    }
                 }
                 Ok(())
             });
@@ -366,7 +371,9 @@ fn compile_cf_pipeline(
             // Drain remaining batches
             for (table_name, (_, payload_vec)) in raw_batches {
                 if !payload_vec.is_empty() {
-                    let _ = chunk_tx.send((table_name, payload_vec));
+                    if chunk_tx.send((table_name, payload_vec)).is_err() {
+                        break; // Consumer dropped, stop draining
+                    }
                 }
             }
             drop(chunk_tx); // Signal parsers to stop
