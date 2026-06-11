@@ -131,7 +131,7 @@ impl Config {
                 .parse()
                 .context("FLUSH_JITTER_SECS must be a number")?,
             flush_size_bytes: env::var("FLUSH_SIZE_BYTES")
-                .unwrap_or_else(|_| "536870912".to_string())
+                .unwrap_or_else(|_| "134217728".to_string())
                 .parse()
                 .context("FLUSH_SIZE_BYTES must be a number")?,
             flush_size_jitter_bytes: env::var("FLUSH_SIZE_JITTER_BYTES")
