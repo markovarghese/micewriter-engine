@@ -50,6 +50,8 @@ All frames use a **4-byte big-endian length prefix** followed by:
 | `FLUSH_INTERVAL_SECS` | no | `300` | Base flush interval |
 | `FLUSH_JITTER_SECS` | no | `60` | Random jitter added/subtracted to interval |
 | `MAX_RETAINED_FROZEN_CFS` | no | `8` | Reject ingest with backpressure error once this many frozen CFs are pending flush. `0` disables. |
+| `ENABLE_MANUAL_FLUSH` | no | `true` | Accepts manual flush requests via IPC socket. |
+| `MALLOC_CONF` | no | `background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0` | Optional memory allocator tuning for `jemalloc`. |
 
 ## Building and Deploying
 

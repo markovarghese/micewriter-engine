@@ -22,6 +22,7 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes"
 # SSE4.2 + PCLMULQDQ for RocksDB hardware CRC32C (defines __SSE4_2__ in crc32c.cc)
 ENV CFLAGS="-msse4.2 -mpclmul"
 ENV CXXFLAGS="-msse4.2 -mpclmul"
+ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
 
 # Cache dependency compilation separately from source.
 COPY Cargo.toml Cargo.lock ./

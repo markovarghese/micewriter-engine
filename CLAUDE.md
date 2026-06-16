@@ -44,7 +44,7 @@ All frames use a **4-byte big-endian length prefix** + 1-byte message type discr
 
 - `0x01` (`MSG_REGISTER_SCHEMA`): JSON `RegisterSchema` body — sent once per table on SDK startup. Stored in an in-memory `SchemaRegistry` (`Arc<RwLock<HashMap<String, RegisterSchema>>>`). **Lost on restart; SDK must re-register.**
 - `0x02` (`MSG_INGEST_RECORD`): Custom binary frame — `[u16 table_name_len][table_name_bytes][JSON stream bytes]`. The batching writer thread converts the JSON body to a self-describing Arrow IPC stream (`arrow_convert::json_to_ipc`) before persisting, so RocksDB stores `[u16 table_name_len][table_name_bytes][Arrow IPC bytes]`. Records for tables without a registered schema are NACKed.
-- `0x03` (`MSG_FLUSH_NOW`): No body — triggers an immediate flush cycle. Only accepted when `ENABLE_MANUAL_FLUSH=true`; used for testing.
+- `0x03` (`MSG_FLUSH_NOW`): No body — triggers an immediate flush cycle. Accepted by default unless `ENABLE_MANUAL_FLUSH=false`; used for testing.
 - ACK responses (Engine → SDK): 4-byte length prefix + JSON `AckResponse`.
 
 ### RocksDB Column Family Rotation

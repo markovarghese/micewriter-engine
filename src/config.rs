@@ -139,8 +139,8 @@ impl Config {
                 .parse()
                 .context("FLUSH_SIZE_JITTER_BYTES must be a number")?,
             enable_manual_flush: env::var("ENABLE_MANUAL_FLUSH")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(false),
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
             rocksdb_path: env::var("ROCKSDB_PATH")
                 .unwrap_or_else(|_| "/var/lib/rocksdb".to_string()),
             rocksdb_sync_writes: env::var("ROCKSDB_SYNC_WRITES")
