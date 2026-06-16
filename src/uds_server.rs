@@ -361,29 +361,26 @@ async fn handle_ingest_record(
             warn!(
                 bytes = unflushed_bytes,
                 limit = max_unflushed_bytes,
-                "Engine entering backpressure — rejecting ingest to protect memory limits"
+                "Engine entering backpressure — pausing ingest to protect memory limits"
             );
         }
-        return AckResponse::error(format!(
-            "engine in backpressure: total unflushed bytes ({}) exceeds hard limit ({})",
-            unflushed_bytes, max_unflushed_bytes
-        ));
+        while store.total_unflushed_bytes() > max_unflushed_bytes {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
     }
 
     if config.max_retained_frozen_cfs > 0 {
-        let retained = store.retained_cf_count();
-        if retained >= config.max_retained_frozen_cfs {
+        if store.retained_cf_count() >= config.max_retained_frozen_cfs {
             if !IN_BACKPRESSURE.swap(true, Ordering::Relaxed) {
                 warn!(
-                    retained,
+                    retained = store.retained_cf_count(),
                     limit = config.max_retained_frozen_cfs,
-                    "Engine entering backpressure — rejecting ingest due to too many pending frozen CFs"
+                    "Engine entering backpressure — pausing ingest due to too many pending frozen CFs"
                 );
             }
-            return AckResponse::error(format!(
-                "engine in backpressure: retained frozen CFs ({}) meets or exceeds limit ({})",
-                retained, config.max_retained_frozen_cfs
-            ));
+            while store.retained_cf_count() >= config.max_retained_frozen_cfs {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
         }
     }
     

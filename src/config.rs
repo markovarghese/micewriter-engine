@@ -161,20 +161,26 @@ impl Config {
                 .parse()
                 .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
-                .unwrap_or_else(|_| "8".to_string())
+                .unwrap_or_else(|_| "2".to_string())
                 .parse()
                 .context("MAX_RETAINED_FROZEN_CFS must be an integer")?,
             parser_threads: env::var("PARSER_THREADS")
                 .map(|s| s.parse().context("PARSER_THREADS must be a positive integer"))
                 .unwrap_or_else(|_| Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)))?,
-            write_buffer_size: 4 * 1024 * 1024,
-            concurrent_cf_flushes: 1,
+            write_buffer_size: env::var("WRITE_BUFFER_SIZE")
+                .unwrap_or_else(|_| "67108864".to_string())
+                .parse()
+                .context("WRITE_BUFFER_SIZE must be a positive integer")?,
+            concurrent_cf_flushes: env::var("CONCURRENT_CF_FLUSHES")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .context("CONCURRENT_CF_FLUSHES must be a positive integer")?,
             target_parquet_bytes: env::var("TARGET_PARQUET_BYTES")
                 .unwrap_or_else(|_| "67108864".to_string())
                 .parse()
                 .context("TARGET_PARQUET_BYTES must be a positive integer")?,
             parquet_row_group_bytes: env::var("PARQUET_ROW_GROUP_BYTES")
-                .unwrap_or_else(|_| "16777216".to_string())
+                .unwrap_or_else(|_| "8388608".to_string())
                 .parse()
                 .context("PARQUET_ROW_GROUP_BYTES must be a positive integer")?,
             parquet_compression: parse_parquet_compression(
@@ -196,7 +202,7 @@ impl Config {
 
         // 3. Scale concurrent CF flushes. 
         // We budget 1 CF pipeline per 256MB of RAM.
-        config.concurrent_cf_flushes = (mem_limit_bytes / (256 * 1024 * 1024)).max(1) as usize;
+        // config.concurrent_cf_flushes = (mem_limit_bytes / (128 * 1024 * 1024)).max(1) as usize;
 
         // 4. Scale RocksDB write buffer size dynamically.
         // Base is 4MB. Scale up by parser threads (more throughput = bigger buffers needed)

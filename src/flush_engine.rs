@@ -44,8 +44,12 @@ pub async fn run_flush_loop(
     flush_semaphore: Arc<tokio::sync::Semaphore>,
 ) {
     loop {
-        let sleep_secs = jittered_interval(&config);
-        info!(secs = sleep_secs, "Next flush scheduled");
+        let sleep_secs = if store.retained_cf_count() > 0 {
+            10 // Retry every 10 seconds if we have retained CFs instead of waiting 10 minutes
+        } else {
+            jittered_interval(&config)
+        };
+        info!(secs = sleep_secs, retained = store.retained_cf_count(), "Next flush scheduled");
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {

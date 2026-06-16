@@ -39,6 +39,8 @@ pub struct RocksStore {
     total_unflushed_bytes: AtomicU64,
     /// Exact sizes of each frozen CF
     frozen_cf_sizes: Arc<RwLock<HashMap<String, u64>>>,
+    /// Configured write buffer size
+    write_buffer_size: usize,
 }
 
 impl RocksStore {
@@ -66,9 +68,12 @@ impl RocksStore {
 
         let mut cf_opts = Options::default();
         cf_opts.set_write_buffer_size(write_buffer_size);
-        cf_opts.set_max_write_buffer_number(2);
+        cf_opts.set_max_write_buffer_number(3);
         cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
         cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
+        cf_opts.set_disable_auto_compactions(true);
+        cf_opts.set_level_zero_slowdown_writes_trigger(1_000_000);
+        cf_opts.set_level_zero_stop_writes_trigger(1_000_000);
 
         let cf_descriptors: Vec<_> = cfs
             .iter()
@@ -138,6 +143,7 @@ impl RocksStore {
             sync_writes,
             total_unflushed_bytes: AtomicU64::new(total_unflushed),
             frozen_cf_sizes: Arc::new(RwLock::new(frozen_sizes)),
+            write_buffer_size,
         };
         store.reset_size_limit();
         Ok(store)
@@ -193,10 +199,13 @@ impl RocksStore {
             let new_cf = format!("active_{}", ts);
 
             let mut cf_opts = Options::default();
-            cf_opts.set_write_buffer_size(4 * 1024 * 1024);
-            cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_write_buffer_size(self.write_buffer_size);
+            cf_opts.set_max_write_buffer_number(3);
             cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
             cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
+            cf_opts.set_disable_auto_compactions(true);
+            cf_opts.set_level_zero_slowdown_writes_trigger(1_000_000);
+            cf_opts.set_level_zero_stop_writes_trigger(1_000_000);
             self.db.write().unwrap().create_cf(&new_cf, &cf_opts)?;
             *active = new_cf;
             
