@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::{CatalogType, Config};
 use crate::field_type::MappedType;
 use crate::metrics;
-use crate::protocol::FieldDef;
+use crate::field_type::FieldDef;
 
 /// Process-lifetime caches to avoid redundant Glue/Nessie metadata API calls.
 ///

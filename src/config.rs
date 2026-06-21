@@ -1,5 +1,6 @@
 use std::env;
 use anyhow::{Context, Result};
+use crate::field_type::FieldDef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogType {
@@ -10,8 +11,11 @@ pub enum CatalogType {
 pub struct Config {
     pub catalog_type: CatalogType,
 
-    /// Path to the Unix Domain Socket the UDS server listens on.
-    pub socket_path: String,
+    /// The specific Iceberg table this engine pipeline is pinned to.
+    pub micewriter_table: String,
+
+    /// Port for the gRPC server.
+    pub grpc_port: u16,
 
     // MinIO / Nessie specific properties (required if catalog_type == Nessie)
     pub minio_url: Option<String>,
@@ -46,21 +50,8 @@ pub struct Config {
     /// "durable local buffer" contract.
     pub rocksdb_sync_writes: bool,
 
-    /// How many records compile_cf buffers per table before flushing the
-    /// batch through JSON→Arrow→Parquet. Larger values trade memory for
-    /// fewer arrow_json invocations. Default 1000.
-    pub flush_compile_batch_size: usize,
-
-    /// Maximum byte size of uncompressed JSON records to buffer per table before
-    /// forcing an early flush to Parquet during compilation to bound memory. Default 4 MB.
-    pub flush_compile_batch_bytes: usize,
-
     /// Number of frozen CFs to retain before enforcing backpressure. Default 3. 0 disables the limit.
     pub max_retained_frozen_cfs: usize,
-
-    /// Number of parallel parser threads to spawn for compiling JSON to Arrow.
-    /// Defaults to the number of available CPUs (respecting container limits).
-    pub parser_threads: usize,
 
     pub write_buffer_size: usize,
     pub concurrent_cf_flushes: usize,
@@ -78,6 +69,28 @@ pub struct Config {
 
     /// Parquet compression codec (default SNAPPY). Accepts NONE|SNAPPY|ZSTD.
     pub parquet_compression: parquet::basic::Compression,
+
+    /// Field definitions loaded from schemas/<MICEWRITER_TABLE>.json at startup.
+    /// Used for Iceberg table creation and schema validation.
+    pub field_defs: Vec<FieldDef>,
+}
+
+fn load_field_defs(table: &str, schemas_dir: &str) -> Result<Vec<FieldDef>> {
+    let path = std::path::Path::new(schemas_dir).join(format!("{}.json", table));
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read schema file {:?}", path))?;
+    let schema: serde_json::Value = serde_json::from_str(&content)
+        .context("Failed to parse schema JSON")?;
+    let mut defs = Vec::new();
+    if let Some(fields) = schema.get("fields").and_then(|f| f.as_array()) {
+        for field in fields {
+            let name = field["name"].as_str().unwrap_or("unknown").to_string();
+            let field_type = field["type"].as_str().unwrap_or("string").to_string();
+            let required = field["required"].as_bool().unwrap_or(false);
+            defs.push(FieldDef { name, field_type, required });
+        }
+    }
+    Ok(defs)
 }
 
 fn parse_parquet_compression(s: &str) -> anyhow::Result<parquet::basic::Compression> {
@@ -110,10 +123,18 @@ impl Config {
             }
         }
 
+        let micewriter_table = env::var("MICEWRITER_TABLE")
+            .context("MICEWRITER_TABLE environment variable is strictly required in v2")?;
+        let schemas_dir = env::var("SCHEMAS_DIR").unwrap_or_else(|_| "./schemas".to_string());
+        let field_defs = load_field_defs(&micewriter_table, &schemas_dir)?;
+
         let mut config = Config {
             catalog_type,
-            socket_path: env::var("SOCKET_PATH")
-                .unwrap_or_else(|_| "/var/run/app/iceberg.sock".to_string()),
+            micewriter_table,
+            grpc_port: env::var("GRPC_PORT")
+                .unwrap_or_else(|_| "9090".to_string())
+                .parse()
+                .context("GRPC_PORT must be a valid u16 port number")?,
             minio_url,
             minio_access_key,
             minio_secret_key,
@@ -146,27 +167,10 @@ impl Config {
             rocksdb_sync_writes: env::var("ROCKSDB_SYNC_WRITES")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
-            flush_compile_batch_size: env::var("FLUSH_COMPILE_BATCH_SIZE")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .context("FLUSH_COMPILE_BATCH_SIZE must be a positive integer")
-                .and_then(|n: usize| {
-                    if n == 0 {
-                        anyhow::bail!("FLUSH_COMPILE_BATCH_SIZE must be > 0");
-                    }
-                    Ok(n)
-                })?,
-            flush_compile_batch_bytes: env::var("FLUSH_COMPILE_BATCH_BYTES")
-                .unwrap_or_else(|_| "4194304".to_string())
-                .parse()
-                .context("FLUSH_COMPILE_BATCH_BYTES must be a positive integer")?,
             max_retained_frozen_cfs: env::var("MAX_RETAINED_FROZEN_CFS")
                 .unwrap_or_else(|_| "2".to_string())
                 .parse()
                 .context("MAX_RETAINED_FROZEN_CFS must be an integer")?,
-            parser_threads: env::var("PARSER_THREADS")
-                .map(|s| s.parse().context("PARSER_THREADS must be a positive integer"))
-                .unwrap_or_else(|_| Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)))?,
             write_buffer_size: env::var("WRITE_BUFFER_SIZE")
                 .unwrap_or_else(|_| "67108864".to_string())
                 .parse()
@@ -186,28 +190,19 @@ impl Config {
             parquet_compression: parse_parquet_compression(
                 &env::var("PARQUET_COMPRESSION").unwrap_or_else(|_| "SNAPPY".to_string()),
             )?,
+            field_defs,
         };
 
-        // 1. Read the exact memory limit injected by the sidecar webhook. Default to 512 MiB.
+        // 1. Read the exact memory limit injected by the pipeline. Default to 512 MiB.
         let mem_limit_bytes = env::var("ENGINE_MEM_LIMIT_BYTES")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(512 * 1024 * 1024);
 
-        // 2. Scale flush_compile_batch_bytes dynamically.
-        // We budget ~1% of total memory for raw strings, which expands to ~10% under arrow_json overhead.
-        let raw_string_budget = mem_limit_bytes / 100;
-        config.flush_compile_batch_bytes = (raw_string_budget / config.parser_threads as u64) as usize;
-        config.flush_compile_batch_bytes = config.flush_compile_batch_bytes.max(256 * 1024); // 256KB floor
-
-        // 3. Scale concurrent CF flushes. 
-        // We budget 1 CF pipeline per 256MB of RAM.
-        // config.concurrent_cf_flushes = (mem_limit_bytes / (128 * 1024 * 1024)).max(1) as usize;
-
-        // 4. Scale RocksDB write buffer size dynamically.
-        // Base is 4MB. Scale up by parser threads (more throughput = bigger buffers needed)
+        // 2. Scale RocksDB write buffer size dynamically.
         // Cap at 64MB to prevent excessive memory usage.
-        config.write_buffer_size = (4 * 1024 * 1024 * config.parser_threads).min(64 * 1024 * 1024);
+        let parser_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
+        config.write_buffer_size = (4 * 1024 * 1024 * parser_threads).min(64 * 1024 * 1024);
 
         Ok(config)
     }

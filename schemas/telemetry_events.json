@@ -1,0 +1,8 @@
+{
+  "type": "struct",
+  "fields": [
+    { "id": 1, "name": "id", "required": true, "type": "string" },
+    { "id": 2, "name": "source", "required": false, "type": "string" },
+    { "id": 3, "name": "occurred_at", "required": false, "type": "long" }
+  ]
+}

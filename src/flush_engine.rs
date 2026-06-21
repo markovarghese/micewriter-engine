@@ -20,7 +20,6 @@ use crate::config::Config;
 use crate::iceberg_writer::{self, IcebergState};
 use crate::metrics;
 use crate::rocksdb_store::RocksStore;
-use crate::uds_server::SchemaRegistry;
 
 type IcebergTableWriter = iceberg::writer::base_writer::data_file_writer::DataFileWriter<
     ParquetWriterBuilder,
@@ -28,14 +27,8 @@ type IcebergTableWriter = iceberg::writer::base_writer::data_file_writer::DataFi
     DefaultFileNameGenerator,
 >;
 
-/// Background task: sleeps for a jittered interval, then rotates the active
-/// RocksDB column family and flushes all frozen records to Iceberg.
-///
-/// Exits when `shutdown` flips to `true`. The caller is responsible for
-/// running the emergency flush after this returns.
 pub async fn run_flush_loop(
     store: Arc<RocksStore>,
-    registry: SchemaRegistry,
     config: Arc<Config>,
     state: Arc<IcebergState>,
     flush_trigger: Arc<tokio::sync::Notify>,
@@ -45,7 +38,7 @@ pub async fn run_flush_loop(
 ) {
     loop {
         let sleep_secs = if store.retained_cf_count() > 0 {
-            10 // Retry every 10 seconds if we have retained CFs instead of waiting 10 minutes
+            10
         } else {
             jittered_interval(&config)
         };
@@ -67,7 +60,7 @@ pub async fn run_flush_loop(
             }
         }
 
-        if let Err(e) = do_flush(Arc::clone(&store), &registry, &config, Arc::clone(&state), &commit_tx, Arc::clone(&flush_semaphore)).await {
+        if let Err(e) = do_flush(Arc::clone(&store), &config, Arc::clone(&state), &commit_tx, Arc::clone(&flush_semaphore)).await {
             error!("Flush cycle failed: {:#}", e);
         }
     }
@@ -78,19 +71,17 @@ pub struct CommitRequest {
     pub table_data_files: HashMap<String, Vec<iceberg::spec::DataFile>>,
 }
 
-/// Batched Iceberg Commit loop.
 pub async fn run_committer_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<CommitRequest>,
     catalog: Arc<crate::iceberg_writer::CatalogHandle>,
     state: Arc<IcebergState>,
-    registry: SchemaRegistry,
     store: Arc<RocksStore>,
+    config: Arc<Config>,
 ) {
     loop {
-        // Wait for at least one request
         let first_req = match rx.recv().await {
             Some(req) => req,
-            None => break, // Channel closed (shutdown)
+            None => break,
         };
 
         let mut batch = vec![first_req];
@@ -108,26 +99,20 @@ pub async fn run_committer_loop(
             cfs_to_drop.push(req.cf_name);
         }
 
-        let schemas = registry.read().unwrap().clone();
         let mut fully_committed = true;
 
         for (table_name, data_files) in all_data_files {
             if data_files.is_empty() { continue; }
-            // A panic here would silently kill the committer loop, so degrade to
-            // a retained-CF retry instead if the schema has somehow vanished.
-            let Some(schema) = schemas.get(&table_name) else {
-                error!(table = %table_name, "No registered schema at commit time — retaining CFs");
-                fully_committed = false;
-                continue;
-            };
+
+            let namespace = vec!["analytics".to_string()];
 
             if let Err(e) = iceberg_writer::commit_data_files(
                 &catalog,
                 &state,
                 &table_name,
-                &schema.namespace,
+                &namespace,
                 data_files,
-                &schema.fields,
+                &config.field_defs,
             ).await {
                 error!(table = %table_name, "Batched table commit failed: {:#}", e);
                 fully_committed = false;
@@ -154,10 +139,8 @@ pub async fn run_committer_loop(
     info!("Iceberg committer loop exited cleanly");
 }
 
-/// Perform one full flush cycle: rotate → pre-fetch table contexts → stream to S3 → send to committer.
 pub async fn do_flush(
     store: Arc<RocksStore>,
-    registry: &SchemaRegistry,
     config: &Config,
     state: Arc<IcebergState>,
     commit_tx: &tokio::sync::mpsc::UnboundedSender<CommitRequest>,
@@ -179,26 +162,21 @@ pub async fn do_flush(
             return Err(e);
         }
     };
-    let schemas = registry.read().unwrap().clone();
 
-    // Pre-fetch table write contexts (FileIO + location + Iceberg schema) for all known schemas.
-    // This resolves/creates the Iceberg table metadata once, before entering
-    // the blocking compile phase where we can't make async catalog calls.
-    let mut table_write_contexts: HashMap<
-        String,
-        (iceberg::io::FileIO, String, iceberg::spec::SchemaRef),
-    > = HashMap::new();
-    for (table_name, schema) in &schemas {
-        match iceberg_writer::get_table_write_context(
-            &catalog, &state, table_name, &schema.namespace, &schema.fields,
-        ).await {
-            Ok(ctx) => { table_write_contexts.insert(table_name.clone(), ctx); }
-            Err(e) => { error!(table = %table_name, "Failed to resolve table write context: {:#}", e); }
-        }
-    }
+    let table_name = config.micewriter_table.clone();
+    let namespace = vec!["analytics".to_string()];
+
+    // get_table_write_context creates the table if absent and returns (FileIO, location, Iceberg SchemaRef)
+    let write_context = iceberg_writer::get_table_write_context(
+        &catalog, &state, &table_name, &namespace, &config.field_defs,
+    ).await.context("Failed to get table write context")?;
+
+    // Arrow schema for serde_arrow serialization — built from field_defs to avoid
+    // any Iceberg→Arrow conversion dependency.
+    let arrow_schema = Arc::new(field_defs_to_arrow_schema(&config.field_defs));
 
     let rt_handle = tokio::runtime::Handle::current();
-    let table_write_contexts = Arc::new(table_write_contexts);
+    let write_context = Arc::new(write_context);
 
     let mut handles = Vec::new();
 
@@ -206,13 +184,12 @@ pub async fn do_flush(
         info!(cf = %cf, "Flushing CF in background task");
         let store_clone = Arc::clone(&store);
         let cf_clone = cf.clone();
-        let batch_size = config.flush_compile_batch_size;
-        let batch_bytes = config.flush_compile_batch_bytes;
-        let parser_threads = config.parser_threads;
         let target_parquet_bytes = config.target_parquet_bytes;
         let parquet_row_group_bytes = config.parquet_row_group_bytes;
         let parquet_compression = config.parquet_compression;
-        let table_write_contexts_clone = Arc::clone(&table_write_contexts);
+        let table_name_clone = table_name.clone();
+        let write_context_clone = Arc::clone(&write_context);
+        let arrow_schema_clone = Arc::clone(&arrow_schema);
         let rt_handle_clone = rt_handle.clone();
 
         let commit_tx_clone = commit_tx.clone();
@@ -224,39 +201,36 @@ pub async fn do_flush(
 
             let permit = sem_clone.acquire_owned().await.unwrap();
 
-            // Stages 1–4 all run in a single spawn_blocking: reader, parser pool,
-            // compressor, and streaming S3 upload (via rt_handle.block_on).
             let compile_handle = tokio::task::spawn_blocking(move || {
-                let _permit = permit; // Hold semaphore for entire compile+upload duration
+                let _permit = permit;
                 compile_cf_pipeline(
                     &compile_store,
                     &compile_cf,
-                    batch_size,
-                    batch_bytes,
-                    parser_threads,
                     target_parquet_bytes,
                     parquet_row_group_bytes,
                     parquet_compression,
-                    &table_write_contexts_clone,
+                    &write_context_clone,
+                    arrow_schema_clone,
                     rt_handle_clone,
                 )
             });
 
             match compile_handle.await.context("compile task panicked")? {
-                Ok(table_data_files) => {
+                Ok(data_files) => {
+                    let mut table_data_files = HashMap::new();
+                    table_data_files.insert(table_name_clone, data_files);
                     let req = CommitRequest {
                         cf_name: cf_clone.clone(),
                         table_data_files,
                     };
                     if let Err(e) = commit_tx_clone.send(req) {
-                        error!(cf = %cf_clone, "Failed to send commit request to Iceberg committer: {}", e);
+                        error!(cf = %cf_clone, "Failed to send commit request: {}", e);
                         store_clone.retain_frozen_cf(cf_clone);
                     }
                 }
                 Err(e) => {
-                    error!(cf = %cf_clone, "Compile+upload failed, retaining frozen CF: {:#}", e);
+                    error!(cf = %cf_clone, "Compile+upload failed, retaining CF: {:#}", e);
                     store_clone.retain_frozen_cf(cf_clone.clone());
-                    warn!(cf = %cf_clone, retained = store_clone.retained_cf_count(), "Frozen CF retained for recovery");
                 }
             }
 
@@ -269,253 +243,108 @@ pub async fn do_flush(
     Ok(handles)
 }
 
-
-/// Stages 1–4: read RocksDB → parse JSON→Arrow → stream Parquet directly to S3.
-///
-/// Returns a map of table_name → DataFiles for the committer.
-/// Uses rt_handle.block_on() for async S3 writes from within the blocking thread.
 fn compile_cf_pipeline(
     store: &RocksStore,
     cf_name: &str,
-    batch_size: usize,
-    batch_bytes: usize,
-    parser_threads: usize,
     target_parquet_bytes: usize,
     parquet_row_group_bytes: usize,
     parquet_compression: parquet::basic::Compression,
-    table_write_contexts: &HashMap<String, (iceberg::io::FileIO, String, iceberg::spec::SchemaRef)>,
+    write_context: &(iceberg::io::FileIO, String, iceberg::spec::SchemaRef),
+    arrow_schema: std::sync::Arc<arrow::datatypes::Schema>,
     rt_handle: tokio::runtime::Handle,
-) -> Result<HashMap<String, Vec<iceberg::spec::DataFile>>> {
-    // Double-buffer only: each queued entry is a full chunk (~flush_compile_batch_bytes
-    // of IPC, decoding to ≥ that in Arrow), so depth directly multiplies resident
-    // memory per pipeline — 16-deep at 1 parser thread held ~170MB of read-ahead
-    // and OOMed the 512Mi pod at conc=2. The writer (S3 upload) is the slowest
-    // stage; depth 2 keeps every stage busy without accumulating read-ahead.
-    let queue_size = 2;
+) -> Result<Vec<iceberg::spec::DataFile>> {
+    let (file_io, location, iceberg_schema) = write_context;
 
-    // Stage 1 & 2: Reader & Parsers
-    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(String, Vec<Vec<u8>>)>(queue_size);
-    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<(String, Vec<arrow::record_batch::RecordBatch>, usize)>(queue_size);
-    let chunk_rx = Arc::new(std::sync::Mutex::new(chunk_rx));
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet_compression)
+        .set_max_row_group_size(1024 * 1024)
+        .build();
 
-    let mut parser_handles = Vec::new();
-    for _ in 0..parser_threads {
-        let chunk_rx_clone = Arc::clone(&chunk_rx);
-        let parsed_tx_clone = parsed_tx.clone();
-        parser_handles.push(tokio::task::spawn_blocking(move || {
-            loop {
-                let (table_name, chunk) = match chunk_rx_clone.lock().unwrap().recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break, // Channel closed
-                };
+    let loc_gen = DefaultLocationGenerator::with_data_location(format!("{}/data", location));
+    let name_gen = DefaultFileNameGenerator::new(Uuid::new_v4().to_string(), None, DataFileFormat::Parquet);
+    let parquet_builder = ParquetWriterBuilder::new(props, iceberg_schema.clone());
+    let rolling_builder = RollingFileWriterBuilder::new(parquet_builder, target_parquet_bytes, file_io.clone(), loc_gen, name_gen);
 
-                // IPC is self-describing — decode directly, no schema registry lookup needed.
-                // Sum raw IPC bytes before consuming chunk — get_array_memory_size over-counts
-                // shared buffer capacity in multi-column batches, inflating the threshold ~25×.
-                let chunk_bytes: usize = chunk.iter().map(|b| b.len()).sum();
-                let mut batches = Vec::new();
-                for ipc_bytes in chunk {
-                    match crate::arrow_convert::ipc_to_batches(&ipc_bytes) {
-                        Ok(bs) => batches.extend(bs),
-                        Err(e) => tracing::warn!(table = %table_name, "IPC decode failed: {}", e),
-                    }
-                }
-                if !batches.is_empty() {
-                    // Merge the chunk's (mostly single-row) batches so the Parquet
-                    // writer sees one batch per chunk instead of thousands.
-                    let schema = batches[0].schema();
-                    let batches = match arrow::compute::concat_batches(&schema, &batches) {
-                        Ok(merged) => vec![merged],
-                        Err(e) => {
-                            tracing::warn!(table = %table_name, "concat_batches failed, writing unmerged: {}", e);
-                            batches
-                        }
-                    };
-                    if parsed_tx_clone.send((table_name, batches, chunk_bytes)).is_err() {
-                        break; // Receiver dropped, abort pipeline
-                    }
-                }
+    let mut writer = rt_handle
+        .block_on(DataFileWriterBuilder::new(rolling_builder).build(None))
+        .context("DataFileWriterBuilder::build failed")?;
+
+    let mut events: Vec<crate::schema_codegen::TelemetryEvents> = Vec::new();
+
+    let mut io_err = None;
+
+    // Records in RocksDB are raw CBOR bytes — the [u16 table_name] envelope is
+    // stripped at ingest time. The pipeline is pinned to one table, so every
+    // record in any CF belongs to that table.
+    let _ = store.iterate_cf(cf_name, |cbor_bytes| {
+        match ciborium::from_reader::<crate::schema_codegen::TelemetryEvents, _>(cbor_bytes) {
+            Ok(event) => events.push(event),
+            Err(e) => warn!("Failed to parse CBOR record: {}", e),
+        }
+
+        if events.len() >= 10000 {
+            if let Err(e) = flush_events_to_writer(&mut writer, &mut events, &arrow_schema, &rt_handle) {
+                io_err = Some(e);
+                return Err(anyhow::anyhow!("Writer error"));
             }
-        }));
+        }
+
+        Ok(())
+    });
+
+    if let Some(e) = io_err {
+        let _ = rt_handle.block_on(writer.close());
+        return Err(e);
     }
-    drop(chunk_rx); // Drop the main thread's copy of the Receiver so it closes when parsers exit!
 
-    let completed_data_files = std::thread::scope(|s| -> Result<HashMap<String, Vec<iceberg::spec::DataFile>>> {
-        let parsed_rx = parsed_rx; // Take ownership so it drops when this closure returns
-        // Stage 1: Reader (scoped thread).
-        // chunk_tx and parsed_tx are moved in so dropping them inside closes the channels.
-        s.spawn(move || {
-            let mut raw_batches: HashMap<String, (usize, Vec<Vec<u8>>)> = HashMap::new();
-            let _ = store.iterate_cf(cf_name, |record_bytes| {
-                if record_bytes.len() < 2 { return Ok(()); }
-                let table_name_len = u16::from_be_bytes([record_bytes[0], record_bytes[1]]) as usize;
-                if record_bytes.len() < 2 + table_name_len { return Ok(()); }
+    if !events.is_empty() {
+        flush_events_to_writer(&mut writer, &mut events, &arrow_schema, &rt_handle)?;
+    }
 
-                let table_name_bytes = &record_bytes[2..2 + table_name_len];
-                let table_name = match std::str::from_utf8(table_name_bytes) {
-                    Ok(t) => t.to_string(),
-                    Err(_) => return Ok(()),
-                };
+    let data_files = rt_handle.block_on(writer.close()).context("IcebergWriter::close failed")?;
 
-                let payload_bytes = &record_bytes[2 + table_name_len..];
-                let payload_len = payload_bytes.len();
-                let (current_bytes, payload_vec) = raw_batches.entry(table_name.clone()).or_insert((0, Vec::new()));
-                payload_vec.push(payload_bytes.to_vec());
-                *current_bytes += payload_len;
+    if !data_files.is_empty() {
+        let file_count = data_files.len() as u64;
+        let total_bytes: u64 = data_files.iter().map(|f| f.file_size_in_bytes()).sum();
+        metrics::PARQUET_FILES_WRITTEN.inc_by(file_count);
+        metrics::PARQUET_BYTES_WRITTEN.inc_by(total_bytes);
+        info!(files = file_count, bytes = total_bytes, "Parquet files streamed to S3");
+    }
 
-                if payload_vec.len() >= batch_size || *current_bytes >= batch_bytes {
-                    let chunk = std::mem::replace(payload_vec, Vec::with_capacity(batch_size));
-                    *current_bytes = 0;
-                    if chunk_tx.send((table_name.clone(), chunk)).is_err() {
-                        return Err(anyhow::anyhow!("Pipeline aborted: consumer dropped"));
-                    }
-                }
-                Ok(())
-            });
+    Ok(data_files)
+}
 
-            // Drain remaining batches
-            for (table_name, (_, payload_vec)) in raw_batches {
-                if !payload_vec.is_empty() {
-                    if chunk_tx.send((table_name, payload_vec)).is_err() {
-                        break; // Consumer dropped, stop draining
-                    }
-                }
-            }
-            drop(chunk_tx); // Signal parsers to stop
-            drop(parsed_tx); // Drop reader's copy; channel closes when parsers also exit
-        });
+fn flush_events_to_writer(
+    writer: &mut IcebergTableWriter,
+    events: &mut Vec<crate::schema_codegen::TelemetryEvents>,
+    arrow_schema: &arrow::datatypes::Schema,
+    rt_handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    let batch = serde_arrow::to_record_batch(&arrow_schema.fields, events)
+        .context("Failed to encode struct to Arrow RecordBatch")?;
 
-        // Stage 2 drain is handled by the parser_handles (tokio spawn_blocking).
-        // Stage 3+4: stream RecordBatches through iceberg's native ParquetWriter stack.
-        // RollingFileWriter handles file-size rollover and column stats internally.
-        // close() returns Vec<DataFile> with all stats and DataContentType set.
-        //
-        // table_writers lives outside the streaming closure so that on error we
-        // can still close every open writer (finalizing its multipart upload)
-        // before propagating the failure and retaining the CF.
-        let mut table_writers: HashMap<String, IcebergTableWriter> = HashMap::new();
+    rt_handle.block_on(writer.write(batch)).context("IcebergWriter::write failed")?;
+    events.clear();
+    Ok(())
+}
 
-        let stream_result = (|| -> Result<()> {
-            while let Ok((table_name, batches, chunk_bytes)) = parsed_rx.recv() {
-                // A missing context means the schema registry was lost (pod
-                // restart before the SDK re-registered) or catalog resolution
-                // failed this cycle. Either way the records cannot be written;
-                // fail the whole CF so it is retained and retried next cycle
-                // instead of being silently dropped.
-                let (file_io, location, schema_ref) = table_write_contexts
-                    .get(&table_name)
-                    .with_context(|| format!(
-                        "no write context for table '{}' (schema not registered or catalog unavailable)",
-                        table_name
-                    ))?;
-
-                // Build writer on first batch for this table.
-                if !table_writers.contains_key(&table_name) {
-                    // parquet only exposes a row-count cap on row groups, so
-                    // derive it from the first chunk's average record size to
-                    // hit ~parquet_row_group_bytes per group. A completed row
-                    // group is the unit that flushes to S3 and frees — this is
-                    // the bound on writer memory, independent of file size.
-                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    let avg_record_bytes = (chunk_bytes / rows.max(1)).max(1);
-                    let max_row_group_rows =
-                        (parquet_row_group_bytes / avg_record_bytes).clamp(1, 1024 * 1024);
-                    let props = parquet::file::properties::WriterProperties::builder()
-                        .set_compression(parquet_compression)
-                        .set_max_row_group_size(max_row_group_rows)
-                        .build();
-                    info!(
-                        table = %table_name,
-                        max_row_group_rows,
-                        avg_record_bytes,
-                        "Parquet writer opened"
-                    );
-
-                    let loc_gen = DefaultLocationGenerator::with_data_location(
-                        format!("{}/data", location),
-                    );
-                    let name_gen = DefaultFileNameGenerator::new(
-                        Uuid::new_v4().to_string(),
-                        None,
-                        DataFileFormat::Parquet,
-                    );
-                    let parquet_builder = ParquetWriterBuilder::new(
-                        props,
-                        schema_ref.clone(),
-                    );
-                    let rolling_builder = RollingFileWriterBuilder::new(
-                        parquet_builder,
-                        target_parquet_bytes,
-                        file_io.clone(),
-                        loc_gen,
-                        name_gen,
-                    );
-                    let writer = rt_handle
-                        .block_on(DataFileWriterBuilder::new(rolling_builder).build(None))
-                        .context("DataFileWriterBuilder::build failed")?;
-                    table_writers.insert(table_name.clone(), writer);
-                }
-
-                let tw = table_writers.get_mut(&table_name).unwrap();
-                for batch in batches {
-                    rt_handle
-                        .block_on(tw.write(batch))
-                        .context("IcebergWriter::write failed")?;
-                }
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = stream_result {
-            // Best-effort close so multipart uploads are finalized rather than
-            // left dangling in S3. The resulting files are never committed; the
-            // retained CF re-writes everything on the next cycle.
-            for (table_name, mut writer) in table_writers.drain() {
-                if let Err(ce) = rt_handle.block_on(writer.close()) {
-                    warn!(table = %table_name, "Writer cleanup close failed: {:#}", ce);
-                }
-            }
-            return Err(e);
-        }
-
-        // Finalize all writers; each returns DataFiles with column stats already
-        // computed. Close every writer even if one fails, then propagate the
-        // first error so the CF is retained.
-        let mut completed: HashMap<String, Vec<iceberg::spec::DataFile>> = HashMap::new();
-        let mut close_err: Option<anyhow::Error> = None;
-        for (table_name, mut writer) in table_writers {
-            let data_files = match rt_handle.block_on(writer.close()) {
-                Ok(dfs) => dfs,
-                Err(e) => {
-                    error!(table = %table_name, "IcebergWriter::close failed: {:#}", e);
-                    close_err.get_or_insert(
-                        anyhow::Error::new(e).context("IcebergWriter::close failed"),
-                    );
-                    continue;
-                }
-            };
-            if !data_files.is_empty() {
-                let file_count = data_files.len() as u64;
-                let total_bytes: u64 = data_files.iter().map(|f| f.file_size_in_bytes()).sum();
-                metrics::PARQUET_FILES_WRITTEN.inc_by(file_count);
-                metrics::PARQUET_BYTES_WRITTEN.inc_by(total_bytes);
-                info!(
-                    table = %table_name,
-                    files = file_count,
-                    bytes = total_bytes,
-                    "Parquet files streamed to S3"
-                );
-                completed.entry(table_name).or_default().extend(data_files);
-            }
-        }
-        if let Some(e) = close_err {
-            return Err(e);
-        }
-
-        Ok(completed)
-    })?;
-
-    Ok(completed_data_files)
+/// Build an Arrow schema from the engine's field definitions.
+/// This avoids any Iceberg → Arrow conversion dependency; field types are mapped
+/// via the same `MappedType` logic used to build the Iceberg schema.
+fn field_defs_to_arrow_schema(
+    field_defs: &[crate::field_type::FieldDef],
+) -> arrow::datatypes::Schema {
+    use crate::field_type::MappedType;
+    let mut next_id = 1i32;
+    let fields: Vec<arrow::datatypes::Field> = field_defs
+        .iter()
+        .map(|f| {
+            let data_type = MappedType::from_str_or_string(&f.field_type, &f.name)
+                .to_arrow(&mut next_id);
+            arrow::datatypes::Field::new(&f.name, data_type, !f.required)
+        })
+        .collect();
+    arrow::datatypes::Schema::new(fields)
 }
 
 fn jittered_interval(config: &Config) -> u64 {

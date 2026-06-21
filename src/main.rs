@@ -1,15 +1,13 @@
-mod arrow_convert;
 mod config;
 mod field_type;
 mod flush_engine;
 mod iceberg_writer;
 mod metrics;
-mod protocol;
 mod rocksdb_store;
-mod uds_server;
+mod grpc_server;
+mod schema_codegen;
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tracing::info;
@@ -38,7 +36,8 @@ async fn main() -> Result<()> {
         config.rocksdb_sync_writes,
         config.write_buffer_size,
     )?);
-    let registry: uds_server::SchemaRegistry = Arc::new(RwLock::new(HashMap::new()));
+    // We no longer need the dynamic SchemaRegistry from uds_server
+    // because schema is AOT compiled.
     let iceberg_state = Arc::new(iceberg_writer::IcebergState::default());
 
     let flush_trigger = Arc::new(tokio::sync::Notify::new());
@@ -58,7 +57,6 @@ async fn main() -> Result<()> {
         let app = axum::Router::new().route(
             "/debug/pprof/flamegraph",
             axum::routing::get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                use axum::response::IntoResponse;
                 let seconds = params.get("seconds")
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(15)
@@ -101,18 +99,16 @@ async fn main() -> Result<()> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // Spawn the UDS server.
-    let uds_store = Arc::clone(&store);
-    let uds_registry = Arc::clone(&registry);
-    let uds_config = Arc::clone(&config);
-    let uds_flush_trigger = Arc::clone(&flush_trigger);
-    let uds_socket = config.socket_path.clone();
-    let uds_shutdown_rx = shutdown_rx.clone();
-    let uds_handle = tokio::spawn(async move {
+    // Spawn the gRPC server.
+    let grpc_store = Arc::clone(&store);
+    let grpc_config = Arc::clone(&config);
+    let grpc_flush_trigger = Arc::clone(&flush_trigger);
+    let grpc_shutdown_rx = shutdown_rx.clone();
+    let grpc_handle = tokio::spawn(async move {
         if let Err(e) =
-            uds_server::run_server(&uds_socket, uds_store, uds_registry, uds_config, uds_flush_trigger, uds_shutdown_rx).await
+            grpc_server::run_server(grpc_store, grpc_config, grpc_flush_trigger, grpc_shutdown_rx).await
         {
-            tracing::error!("UDS server error: {:#}", e);
+            tracing::error!("gRPC server error: {:#}", e);
         }
     });
 
@@ -126,22 +122,21 @@ async fn main() -> Result<()> {
         }
     };
     let committer_state = Arc::clone(&iceberg_state);
-    let committer_registry = Arc::clone(&registry);
     let committer_store = Arc::clone(&store);
 
+    let committer_config = Arc::clone(&config);
     let committer_handle = tokio::spawn(async move {
         flush_engine::run_committer_loop(
             commit_rx,
             committer_catalog,
             committer_state,
-            committer_registry,
-            committer_store
+            committer_store,
+            committer_config,
         ).await;
     });
 
     // Spawn the background flush loop.
     let flush_store = Arc::clone(&store);
-    let flush_registry = Arc::clone(&registry);
     let flush_config = Arc::clone(&config);
     let flush_state = Arc::clone(&iceberg_state);
     let flush_loop_trigger = Arc::clone(&flush_trigger);
@@ -151,7 +146,6 @@ async fn main() -> Result<()> {
     let flush_loop_handle = tokio::spawn(async move {
         flush_engine::run_flush_loop(
             flush_store,
-            flush_registry,
             flush_config,
             flush_state,
             flush_loop_trigger,
@@ -169,14 +163,14 @@ async fn main() -> Result<()> {
     // Tell the UDS server and the background flush loop to stop.
     let _ = shutdown_tx.send(true);
 
-    info!("Waiting for active UDS connections to drain...");
-    let _ = uds_handle.await;
+    info!("Waiting for active gRPC connections to drain...");
+    let _ = grpc_handle.await;
 
     info!("Waiting for background flush loop to finish...");
     let _ = flush_loop_handle.await;
 
     // Emergency flush: drain anything in the active CF before exiting.
-    match flush_engine::do_flush(Arc::clone(&store), &registry, &config, Arc::clone(&iceberg_state), &commit_tx, Arc::clone(&flush_semaphore)).await {
+    match flush_engine::do_flush(Arc::clone(&store), &config, Arc::clone(&iceberg_state), &commit_tx, Arc::clone(&flush_semaphore)).await {
         Ok(handles) => {
             info!("Emergency flush spawned, waiting for Parquet compilation & S3 uploads...");
             for handle in handles {

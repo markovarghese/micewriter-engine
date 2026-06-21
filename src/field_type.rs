@@ -6,6 +6,13 @@
 //! Keeping the mapping here prevents the two modules from drifting.
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
+
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: String,
+    pub field_type: String,
+    pub required: bool,
+}
 use iceberg::spec::{PrimitiveType, Type};
 use tracing::warn;
 use std::sync::Arc;

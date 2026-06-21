@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 
 # Local cache
 rocksdb = "0.22"
@@ -22,14 +23,17 @@ iceberg-storage-opendal = "0.9"
 
 # Columnar in-memory format and Parquet serialization
 arrow = "57"
-arrow-json = "57"
+serde_arrow = { version = "0.14", features = ["arrow-57"] }
 parquet = { version = "57", features = ["arrow", "zstd"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ciborium = "0.2"
 
-
+# gRPC transport
+tonic = "0.11"
+prost = "0.12"
 
 # Randomness for flush jitter
 rand = "0.8"
@@ -61,3 +65,8 @@ debug = 1
 
 [features]
 # Native Rust Iceberg support is sufficient; no Python fallback needed.
+
+[build-dependencies]
+tonic-build = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

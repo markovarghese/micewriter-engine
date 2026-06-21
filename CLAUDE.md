@@ -4,23 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-```powershell
-# Build Docker image and push to local k3s registry (primary deployment workflow)
-.\push.ps1
-
-# Docker image only (no push)
-docker build -t micewriter-engine:latest .
-
-# Native Rust build — requires Rust toolchain + C++ compiler + cmake (for RocksDB)
-# First build compiles RocksDB from C++ source: expect 5–10 minutes
-cargo build --release
-
+```bash
 # Dev build
 cargo build
+
+# Release build (first build compiles RocksDB from C++ source: expect 5–10 minutes)
+cargo build --release
 
 # Lint / format
 cargo clippy
 cargo fmt
+
+# Build Docker image and push to local k3s registry (deployment)
+pwsh ./push.ps1
+
+# Docker image only (no push)
+docker build -t micewriter-engine:latest .
 ```
 
 ## Architecture
