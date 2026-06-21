@@ -26,14 +26,28 @@ impl Micewriter for MicewriterService {
         &self,
         request: Request<RegisterSchemaRequest>,
     ) -> Result<Response<Ack>, Status> {
-        let _schema_json = request.into_inner().schema_json;
-        // In the AOT architecture, the schema is statically compiled. 
-        // We could validate that the incoming schema_json matches the expected static schema, 
-        // but for now we just acknowledge it gracefully to unblock the SDK.
-        Ok(Response::new(Ack {
-            ok: true,
-            message: "Schema acknowledged (AOT static schema is active)".to_string(),
-        }))
+        let schema_json = request.into_inner().schema_json;
+        match validate_register_schema(&schema_json, &self.config.micewriter_table, &self.config.field_defs) {
+            Ok(field_count) => {
+                tracing::info!(
+                    table = %self.config.micewriter_table,
+                    fields = field_count,
+                    "RegisterSchema: validated successfully"
+                );
+                Ok(Response::new(Ack {
+                    ok: true,
+                    message: format!("Schema validated — {} fields match AOT schema", field_count),
+                }))
+            }
+            Err(msg) => {
+                tracing::error!(
+                    table = %self.config.micewriter_table,
+                    "RegisterSchema rejected: {}",
+                    msg
+                );
+                Ok(Response::new(Ack { ok: false, message: msg }))
+            }
+        }
     }
 
     async fn ingest(
@@ -111,6 +125,63 @@ impl Micewriter for MicewriterService {
     }
 }
 
+/// Validate an incoming `RegisterSchema` JSON payload against the engine's AOT field definitions.
+///
+/// Returns `Ok(field_count)` on success or `Err(human-readable message)` on any violation.
+/// Extracted as a pure function so it can be unit-tested without a live gRPC service.
+///
+/// Rules (from system-overview.md §2.3):
+/// - Every field the SDK declares must exist in the AOT schema (unknown field → misordered deploy).
+/// - Every field's type must match the AOT type (alias-normalised via MappedType).
+/// - `table` in the payload must match the engine's pinned table name.
+/// - AOT fields absent from the incoming schema are allowed (engine deployed first — valid evolution).
+fn validate_register_schema(
+    schema_json: &str,
+    engine_table: &str,
+    field_defs: &[crate::field_type::FieldDef],
+) -> Result<usize, String> {
+    use crate::field_type::MappedType;
+
+    let incoming: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|e| format!("Invalid schema JSON: {e}"))?;
+
+    if let Some(table) = incoming.get("table").and_then(|t| t.as_str()) {
+        if table != engine_table {
+            return Err(format!(
+                "Table mismatch: engine is pinned to '{engine_table}', schema is for '{table}'"
+            ));
+        }
+    }
+
+    let fields = incoming
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| "Schema JSON missing 'fields' array".to_string())?;
+
+    for field in fields {
+        let name = field.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let type_str = field.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        let aot = field_defs.iter().find(|f| f.name == name).ok_or_else(|| {
+            format!(
+                "Unknown field '{name}' in table '{engine_table}': not present in AOT schema. \
+                 The engine must be deployed and stabilized before the application."
+            )
+        })?;
+
+        let incoming_mapped = MappedType::from_str(type_str);
+        let aot_mapped = MappedType::from_str(&aot.field_type);
+        if incoming_mapped != aot_mapped {
+            return Err(format!(
+                "Field '{name}' type mismatch: SDK sent '{type_str}', AOT schema has '{}'",
+                aot.field_type
+            ));
+        }
+    }
+
+    Ok(fields.len())
+}
+
 pub async fn run_server(
     store: Arc<RocksStore>,
     config: Arc<Config>,
@@ -136,4 +207,87 @@ pub async fn run_server(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_register_schema;
+    use crate::field_type::FieldDef;
+
+    fn telemetry_defs() -> Vec<FieldDef> {
+        vec![
+            FieldDef { name: "id".into(), field_type: "string".into(), required: true },
+            FieldDef { name: "source".into(), field_type: "string".into(), required: false },
+            FieldDef { name: "occurred_at".into(), field_type: "long".into(), required: false },
+        ]
+    }
+
+    #[test]
+    fn exact_schema_match_passes() {
+        let json = r#"{"table":"telemetry_events","namespace":["analytics"],"fields":[
+            {"name":"id","type":"string","required":true},
+            {"name":"source","type":"string","required":false},
+            {"name":"occurred_at","type":"long","required":false}
+        ]}"#;
+        assert_eq!(validate_register_schema(json, "telemetry_events", &telemetry_defs()), Ok(3));
+    }
+
+    #[test]
+    fn partial_schema_passes() {
+        // SDK on older schema — engine has more fields than SDK sends. Valid: engine deployed first.
+        let json = r#"{"table":"telemetry_events","namespace":["analytics"],"fields":[
+            {"name":"id","type":"string","required":true}
+        ]}"#;
+        assert_eq!(validate_register_schema(json, "telemetry_events", &telemetry_defs()), Ok(1));
+    }
+
+    #[test]
+    fn type_alias_normalised() {
+        // SDK sends "int64", AOT schema says "long" — same MappedType, must pass.
+        let defs = vec![FieldDef { name: "ts".into(), field_type: "long".into(), required: false }];
+        let json = r#"{"table":"t","fields":[{"name":"ts","type":"int64","required":false}]}"#;
+        assert_eq!(validate_register_schema(json, "t", &defs), Ok(1));
+    }
+
+    #[test]
+    fn unknown_field_rejected() {
+        let json = r#"{"table":"telemetry_events","fields":[
+            {"name":"id","type":"string","required":true},
+            {"name":"new_column","type":"string","required":false}
+        ]}"#;
+        let err = validate_register_schema(json, "telemetry_events", &telemetry_defs()).unwrap_err();
+        assert!(err.contains("Unknown field 'new_column'"), "got: {err}");
+        assert!(err.contains("engine must be deployed"), "got: {err}");
+    }
+
+    #[test]
+    fn type_mismatch_rejected() {
+        let json = r#"{"table":"telemetry_events","fields":[
+            {"name":"occurred_at","type":"string","required":false}
+        ]}"#;
+        let err = validate_register_schema(json, "telemetry_events", &telemetry_defs()).unwrap_err();
+        assert!(err.contains("type mismatch"), "got: {err}");
+        assert!(err.contains("occurred_at"), "got: {err}");
+    }
+
+    #[test]
+    fn table_mismatch_rejected() {
+        let json = r#"{"table":"wrong_table","fields":[]}"#;
+        let err = validate_register_schema(json, "telemetry_events", &telemetry_defs()).unwrap_err();
+        assert!(err.contains("Table mismatch"), "got: {err}");
+        assert!(err.contains("wrong_table"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_fields_array_rejected() {
+        let json = r#"{"table":"telemetry_events"}"#;
+        let err = validate_register_schema(json, "telemetry_events", &telemetry_defs()).unwrap_err();
+        assert!(err.contains("missing 'fields'"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_json_rejected() {
+        let err = validate_register_schema("not json", "t", &[]).unwrap_err();
+        assert!(err.contains("Invalid schema JSON"), "got: {err}");
+    }
 }
