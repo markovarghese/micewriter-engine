@@ -87,6 +87,51 @@ Then, run your `cargo` commands inside an ephemeral container, mounting your sou
 docker run --rm -it -v ${PWD}:/app -w /app micewriter-engine-dev cargo test
 ```
 
+## Integration Test (FlushNow)
+
+`scripts/integration/flushnow-test.sh` is a black-box gRPC smoke test that verifies a
+deployed engine pod responds correctly to `FlushNow`. It checks RPC plumbing only — the
+async flush path (Parquet → MinIO → Nessie commit) is not asserted here.
+
+### Prerequisites
+
+1. **Infra up** — Nessie + MinIO running in `micewriter-infra` (via `micewriter-local-infra`):
+   ```powershell
+   cd ../micewriter-local-infra && pwsh ./run.ps1 up
+   ```
+2. **Engine deployed** — build/push the image (`push.ps1`) then install the Helm chart:
+   ```bash
+   helm upgrade --install engine-telemetry-events \
+     ../micewriter-local-infra/charts/table-pipeline \
+     --set table=telemetry_events -n micewriter-infra --wait
+   ```
+   The chart default `enableManualFlush=true` must be kept (it is, by default).
+3. **`grpcurl` on PATH** — static binary, no dependencies:
+   ```bash
+   GRPCURL_VER=1.9.1
+   curl -sSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VER}/grpcurl_${GRPCURL_VER}_linux_x86_64.tar.gz" \
+     | tar -xz -C ~/.local/bin grpcurl
+   ```
+
+### Running
+
+```bash
+scripts/integration/flushnow-test.sh
+```
+
+Overridable env vars (with defaults):
+
+| Variable | Default | Description |
+|---|---|---|
+| `TABLE` | `telemetry_events` | Iceberg table the engine is pinned to |
+| `NAMESPACE` | `micewriter-infra` | Kubernetes namespace |
+| `GRPC_PORT` | `9090` | gRPC port on the ClusterIP service |
+| `LOCAL_PORT` | `9090` | Local port for `kubectl port-forward` |
+| `PROTO_DIR` | auto (sibling SDK repo) | Directory containing `micewriter.proto` |
+
+The script port-forwards `svc/engine-telemetry-events`, calls `FlushNow`, asserts
+`Ack{ok: true, message: "Flush triggered"}`, then tears down the port-forward. Exit code 0 = PASS.
+
 ## Iceberg Dependency Versions
 
 We use `iceberg-rust` v0.9+ for full native support of `fast_append` and FileIO operations without needing Python fallbacks.
