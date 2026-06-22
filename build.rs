@@ -3,15 +3,15 @@ use std::fs;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_file = "../micewriter-sdk-java/micewriter-sdk-java-core/src/main/proto/micewriter.proto";
-    
+    let proto_file = "proto/micewriter.proto";
+
     // Tell cargo to recompile if the proto file changes.
     println!("cargo:rerun-if-changed={}", proto_file);
 
     tonic_build::configure()
         .build_server(true)
         .build_client(false)
-        .compile(&[proto_file], &["../micewriter-sdk-java/micewriter-sdk-java-core/src/main/proto"])?;
+        .compile(&[proto_file], &["proto"])?;
 
     // Schema Codegen
     let out_dir = env::var("OUT_DIR").unwrap();

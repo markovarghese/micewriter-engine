@@ -1,0 +1,15 @@
+syntax = "proto3";
+package micewriter.v2;
+option java_package = "com.micewriter.sdk.grpc";
+option java_multiple_files = true;
+
+service Micewriter {
+  rpc RegisterSchema(RegisterSchemaRequest) returns (Ack);
+  rpc Ingest(stream IngestRecord) returns (stream Ack);
+  rpc FlushNow(FlushRequest) returns (Ack);
+}
+
+message RegisterSchemaRequest { string schema_json = 1; }
+message IngestRecord { bytes record = 1; }
+message FlushRequest { string table = 1; }
+message Ack { bool ok = 1; string message = 2; }

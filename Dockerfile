@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     clang \
     libclang-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -25,7 +26,10 @@ ENV CXXFLAGS="-msse4.2 -mpclmul"
 ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
 
 # Cache dependency compilation separately from source.
-COPY Cargo.toml Cargo.lock ./
+# build.rs, schemas/, and proto/ must be present so codegen runs during the dep-cache stage.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY schemas ./schemas
+COPY proto ./proto
 RUN mkdir src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release
 RUN rm -rf src
@@ -49,11 +53,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -r -u 1000 -g daemon micewriter
 
 COPY --from=builder /app/target/release/micewriter-engine /usr/local/bin/micewriter-engine
+COPY --from=builder /app/schemas /app/schemas
 
 # The UDS socket and RocksDB directories are provided by k8s volumes.
 # These placeholders allow local docker-run testing with bind mounts.
 RUN mkdir -p /var/run/app /var/lib/rocksdb \
     && chown micewriter:daemon /var/run/app /var/lib/rocksdb
+
+ENV SCHEMAS_DIR=/app/schemas
 
 USER 1000
 
